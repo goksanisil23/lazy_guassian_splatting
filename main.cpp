@@ -5,6 +5,7 @@
 #include "utils.hpp"
 
 #include <algorithm>
+#include <c10/cuda/CUDACachingAllocator.h>
 #include <fstream>
 #include <numeric>
 #include <random>
@@ -64,6 +65,53 @@ LearnableParams createLearningParamsFromGaussians(const gsplat::Gaussians &gauss
     return params;
 }
 
+void stepChunked(LearnableParams         &params,
+                 const gsplat::Camera    &cam,
+                 torch::optim::Optimizer &optimizer,
+                 torch::Tensor           &image,
+                 torch::Tensor           &gt_image_tensor)
+{
+    // Chunked forward pass
+
+    constexpr int64_t kChunk = 8'000;
+    const int64_t     N      = params.pws.size(0);
+
+    for (int64_t i = 0; i < N; i += kChunk)
+    {
+        std::cout << "chunk " << i / kChunk << " / " << (N + kChunk - 1) / kChunk << std::endl;
+        const int64_t chunk_len = std::min(kChunk, N - i);
+        optimizer.zero_grad();
+        image.reset();
+
+        image = forwardChunked(params, cam, i, chunk_len).permute({2, 0, 1});
+
+        auto loss = gaussianLoss(image, gt_image_tensor);
+        loss.backward();
+        optimizer.step();
+
+        c10::cuda::CUDACachingAllocator::emptyCache();
+    }
+}
+
+void step(LearnableParams         &params,
+          const gsplat::Camera    &cam,
+          torch::optim::Optimizer &optimizer,
+          torch::Tensor           &image,
+          torch::Tensor           &gt_image_tensor)
+{
+    optimizer.zero_grad();
+    image.reset();
+
+    // image = forward(params, cam).permute({2, 0, 1}); // [H,W,C] -> [C,H,W]
+    image = forwardWithCulling(params, cam).permute({2, 0, 1});
+
+    auto loss = gaussianLoss(image, gt_image_tensor);
+    loss.backward();
+    optimizer.step();
+
+    c10::cuda::CUDACachingAllocator::emptyCache();
+}
+
 int main(int argc, char **argv)
 {
     if (argc < 2)
@@ -98,8 +146,7 @@ int main(int argc, char **argv)
     // initialize the index map
     gsplat::GLOBAL_IDX_MAP = makeIdxMap(data.cameras_[0].height, data.cameras_[0].width, data.device_);
 
-    // 4) Training loop
-    const int64_t num_epochs = 100;
+    const int64_t num_epochs = 300;
     for (int64_t epoch = 0; epoch < num_epochs; ++epoch)
     {
         auto const shuffled_img_indices = generateShuffledIndices(data.images_.size());
@@ -112,13 +159,9 @@ int main(int argc, char **argv)
             gsplat::Camera &cam             = data.cameras_[img_idx];
             torch::Tensor   gt_image_tensor = data.images_[img_idx];
 
-            optimizer.zero_grad();
-
-            torch::Tensor image = forward(params, cam).permute({2, 0, 1}); // [H,W,C] -> [C,H,W]
-
-            auto loss = gaussianLoss(image, gt_image_tensor);
-            loss.backward();
-            optimizer.step();
+            torch::Tensor image;
+            step(params, cam, optimizer, image, gt_image_tensor);
+            // stepChunked(params, cam, optimizer, image, gt_image_tensor);
 
             if (img_idx == 0)
             {
@@ -128,7 +171,6 @@ int main(int argc, char **argv)
                 cv::Mat img_mat(image_cpu.size(0), image_cpu.size(1), CV_8UC3, image_cpu.data_ptr());
                 cv::imwrite("rendered_image_epoch_" + std::to_string(epoch) + ".png", img_mat);
             }
-            // float loss_val = loss.item<float>();
             img_ctr++;
         }
     }

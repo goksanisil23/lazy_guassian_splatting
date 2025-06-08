@@ -243,14 +243,6 @@ std::vector<Point3D> loadPoints(const std::string &path)
         }
         pts.push_back(p);
     }
-
-    // Randomly select 1000 points
-    constexpr size_t kMaxPoints = 1000;
-    if (pts.size() > kMaxPoints)
-    {
-        std::shuffle(pts.begin(), pts.end(), std::mt19937{std::random_device{}()});
-        pts.resize(kMaxPoints);
-    }
     return pts;
 }
 } // namespace colmap_loader

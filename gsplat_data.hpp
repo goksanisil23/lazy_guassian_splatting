@@ -129,6 +129,7 @@ class GsplatData
         auto cams = colmap_loader::loadCameras(dataset_path + "/sparse/0/cameras.bin");
         auto ims  = colmap_loader::loadImages(dataset_path + "/sparse/0/images.bin");
         auto pts  = colmap_loader::loadPoints(dataset_path + "/sparse/0/points3D.bin");
+
         std::cout << "Loaded: " << cams.size() << " cameras, " << ims.size() << " images, " << pts.size()
                   << " points3D\n\n";
         colmap_loader::summarize(cams, ims, pts);
@@ -160,6 +161,17 @@ class GsplatData
         }
 
         gaussians_ = initGaussiansFrom3dPoints(pts);
+
+        // TODO: (Remove) Limit the data
+        // {
+        //     gaussians_.pws.resize(50000);
+        //     gaussians_.shs.resize(50000);
+        //     gaussians_.scales.resize(50000);
+        //     gaussians_.rots.resize(50000);
+        //     gaussians_.alphas.resize(50000);
+        //     images_.resize(10);
+        //     cameras_.resize(10);
+        // }
     }
 
   public:

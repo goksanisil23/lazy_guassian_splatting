@@ -232,6 +232,7 @@ torch::Tensor splat(const Camera  &cam,
     auto          device = gaussian_2d_centers.device();
     auto          dtype  = gaussian_2d_centers.dtype();
     torch::Tensor image  = torch::zeros({cam.height, cam.width, 3}, torch::TensorOptions().device(device).dtype(dtype));
+    torch::Tensor image_T = torch::ones({cam.height, cam.width}, torch::TensorOptions().device(device).dtype(dtype));
 
     // Sort indices by depth (ascending)
     torch::Tensor depth_sorted_idxs = depths.argsort();
@@ -239,8 +240,6 @@ torch::Tensor splat(const Camera  &cam,
 
     for (int64_t k = 0; k < num_gaussians; ++k)
     {
-        // std::cout << "Processing gaussian " << k + 1 << " / " << num_gaussians << "\r";
-
         const int64_t idx = depth_sorted_idxs[k].item<int64_t>();
         // Fetch scalar depth value
         const float dpt = depths.index({idx}).item<float>();
@@ -305,213 +304,16 @@ torch::Tensor splat(const Camera  &cam,
         auto alpha_i     = alphas.index({idx});
         auto patch_alpha = torch::exp(-0.5f * maha).mul(alpha_i).clamp_max(0.99f); // [dy,dx]
         auto color_i     = colors.index({idx}).view({1, 1, 3});
-        auto patch       = patch_alpha.unsqueeze(-1).mul(color_i);
 
-        // — Write back into image in-place:
-        // image[y0:y1, x0:x1, :] += patch
-        // image.index_put_({Slice(y0, y1), Slice(x0, x1), Slice()},
-        //                  image.index({Slice(y0, y1), Slice(x0, x1), Slice()}) + patch);
+        auto roi = image.slice(0, y0, y1).slice(1, x0, x1);
 
-        auto roi = image
-                       .slice(0, y0, y1)  // shape = {y1-y0, width, 3}
-                       .slice(1, x0, x1); // shape = {y1-y0, x1-x0, 3}
+        auto roi_T          = image_T.slice(0, y0, y1).slice(1, x0, x1);
+        auto T              = roi_T.clone();
+        auto weighted_alpha = patch_alpha * T;
+        auto patch          = weighted_alpha.unsqueeze(-1).mul(color_i);
         roi.add_(patch);
+        roi_T.mul_(1.0f - patch_alpha);
     }
-    // std::cout << std::endl; // flush the progress bar
-
-    return image;
-}
-
-torch::Tensor splatTiled(const Camera  &cam,
-                         torch::Tensor &gaussian_2d_centers,
-                         torch::Tensor &cov2d_inv,
-                         torch::Tensor &alphas,
-                         torch::Tensor &depths,
-                         torch::Tensor &colors,
-                         torch::Tensor &areas_3_sigma)
-{
-    auto          device = gaussian_2d_centers.device();
-    auto          dtype  = gaussian_2d_centers.dtype();
-    torch::Tensor image  = torch::zeros({cam.height, cam.width, 3}, torch::TensorOptions().device(device).dtype(dtype));
-
-    // 1) Precompute each Gaussian's bbox in pixels
-    const int num_gaussians = depths.size(0);
-
-    std::vector<int> x0(num_gaussians), x1(num_gaussians), y0(num_gaussians), y1(num_gaussians);
-    for (int gaus_idx = 0; gaus_idx < num_gaussians; ++gaus_idx)
-    {
-        float gx  = gaussian_2d_centers[gaus_idx][0].item<float>();
-        float gy  = gaussian_2d_centers[gaus_idx][1].item<float>();
-        int   rx  = areas_3_sigma[gaus_idx][0].item<int>();
-        int   ry  = areas_3_sigma[gaus_idx][1].item<int>();
-        int   _x0 = static_cast<int>(std::clamp(gx - rx, 0.F, static_cast<float>(cam.width)));
-        int   _x1 = static_cast<int>(std::clamp(gx + rx, 0.F, static_cast<float>(cam.width)));
-        int   _y0 = static_cast<int>(std::clamp(gy - ry, 0.F, static_cast<float>(cam.height)));
-        int   _y1 = static_cast<int>(std::clamp(gy + ry, 0.F, static_cast<float>(cam.height)));
-        if (_x1 > _x0 && _y1 > _y0)
-        {
-            x0[gaus_idx] = _x0;
-            x1[gaus_idx] = _x1;
-            y0[gaus_idx] = _y0;
-            y1[gaus_idx] = _y1;
-        }
-        else
-        {
-            // Collapse the gaussian extent to zero
-            x0[gaus_idx] = x1[gaus_idx] = y0[gaus_idx] = y1[gaus_idx] = 0;
-        }
-    }
-
-    // 2) Bin (assign) Gaussians into 32×32 tiles
-    constexpr int TW = 32;
-    constexpr int TH = 32;
-
-    const int                     num_tiles_x = (cam.width + TW - 1) / TW;
-    const int                     num_tiles_y = (cam.height + TH - 1) / TH;
-    std::vector<std::vector<int>> tiles(num_tiles_x * num_tiles_y);
-    for (int gaus_idx = 0; gaus_idx < num_gaussians; ++gaus_idx)
-    {
-        if (x0[gaus_idx] == x1[gaus_idx] || y0[gaus_idx] == y1[gaus_idx])
-            continue;
-        // Calculate the tiles span by this gaussian (1 gaussian might span multiple tiles)
-        int tx0 = x0[gaus_idx] / TW, tx1 = (x1[gaus_idx] - 1) / TW;
-        int ty0 = y0[gaus_idx] / TH, ty1 = (y1[gaus_idx] - 1) / TH;
-        for (int ty = ty0; ty <= ty1; ++ty)
-            for (int tx = tx0; tx <= tx1; ++tx)
-                tiles[ty * num_tiles_x + tx].push_back(gaus_idx);
-    }
-
-    // 3) Process each non-empty tile in one batched Tensor-op
-    auto mesh_grid_options = torch::TensorOptions().device(device).dtype(torch::kLong);
-    for (int ty = 0; ty < num_tiles_y; ++ty)
-    {
-        for (int tx = 0; tx < num_tiles_x; ++tx)
-        {
-            auto &gaus_ids_this_tile = tiles[ty * num_tiles_x + tx];
-            if (gaus_ids_this_tile.empty())
-                continue;
-
-            // tile pixel bounds
-            const int tile_y0     = ty * TH;
-            const int tile_y1     = std::min((ty + 1) * TH, static_cast<int>(cam.height));
-            const int tile_x0     = tx * TW;
-            const int tile_x1     = std::min((tx + 1) * TW, static_cast<int>(cam.width));
-            const int tile_height = tile_y1 - tile_y0;
-            const int tile_width  = tile_x1 - tile_x0;
-
-            // 3a) build meshgrid once
-            auto ys    = torch::arange(tile_y0, tile_y1, mesh_grid_options);
-            auto xs    = torch::arange(tile_x0, tile_x1, mesh_grid_options);
-            auto sub_y = ys.view({tile_height, 1}).expand({tile_height, tile_width});
-            auto sub_x = xs.view({1, tile_width}).expand({tile_height, tile_width});
-
-            // 3b) gather all G params
-            auto idx_tensor =
-                torch::tensor(gaus_ids_this_tile, torch::TensorOptions().dtype(torch::kLong).device(device));
-            auto ctrs  = gaussian_2d_centers.index_select(0, idx_tensor); // [G,2]
-            auto cinv  = cov2d_inv.index_select(0, idx_tensor);           // [G,3]
-            auto a_i   = alphas.index_select(0, idx_tensor);              // [G]
-            auto colsG = colors.index_select(0, idx_tensor);              // [G,3]
-
-            // 3c) Mahalanobis batch
-            auto gx   = ctrs.select(1, 0).unsqueeze(-1).unsqueeze(-1); // [G,1,1]
-            auto gy   = ctrs.select(1, 1).unsqueeze(-1).unsqueeze(-1);
-            auto d0   = sub_x.unsqueeze(0) - gx; // [G,H,W]
-            auto d1   = sub_y.unsqueeze(0) - gy;
-            auto c00  = cinv.select(1, 0).unsqueeze(-1).unsqueeze(-1);
-            auto c01  = cinv.select(1, 1).unsqueeze(-1).unsqueeze(-1);
-            auto c11  = cinv.select(1, 2).unsqueeze(-1).unsqueeze(-1);
-            auto maha = c00 * (d0 * d0) + c11 * (d1 * d1) + 2.f * c01 * (d0 * d1);
-
-            // 3d) alpha & color blend
-            auto alpha = torch::exp(-0.5f * maha).unsqueeze(1) * a_i.view({-1, 1, 1, 1});
-            auto col   = colsG.view({-1, 3, 1, 1});
-            auto patch = alpha * col; // [G,3,H,W]
-
-            // 3e) sum Gaussians → tile_patch [3,H,W]
-            auto tile_patch = patch.sum(0);
-
-            // 3f) write back
-            image.slice(0, tile_y0, tile_y1)
-                .slice(1, tile_x0, tile_x1)
-                .add_(tile_patch.permute({1, 2, 0})); // → [H,W,3]
-        }
-    }
-
-    return image;
-}
-
-torch::Tensor forward(LearnableParams &params, const Camera &cam)
-{
-    // Alphas are limited to [0, 1] range, via sigmoid
-    auto alphas = getAlphas(params.alphas_raw);
-    // Scales are limited to > 0, via exp
-    auto scales = getScales(params.scales_raw);
-    // Rots norms are limited to 1, via normalization
-    auto rots = getRots(params.rots_raw);
-
-    auto shs = getShs(params.low_shs, params.high_shs);
-
-    // 1) Project 3D gaussian centers to camera coordinates and image coordinates
-    torch::Tensor proj_us;
-    auto          points_cam = project(params.pws, cam, proj_us);
-    auto          us         = proj_us.clone().detach().requires_grad_(true);
-
-    // 2) Compute 3D covariance matrices for each gaussian
-    auto cov3d = computeCov3d(scales, rots);
-
-    // 3) Project 3d gaussian to 2d
-    auto cov2d = projectCov3dTo2d(points_cam, cam, cov3d);
-
-    // 4) Compute colors via spherical harmonics
-    auto colors = shToColor(shs, params.pws, cam.tcw);
-
-    // 5) Find 3 sigma areas gaussian would cover in image space
-    torch::Tensor areas_3_sigma;
-    auto          cov2d_inv = inverseCov2d(cov2d, areas_3_sigma);
-
-    // 6) Splat gaussians to image space
-    auto depths = points_cam.index({Slice(), 2});
-    // auto image  = splat(cam, us, cov2d_inv, alphas, depths, colors, areas_3_sigma);
-    auto image = splatTiled(cam, us, cov2d_inv, alphas, depths, colors, areas_3_sigma);
-
-    // auto mask = depths > 0.2;
-
-    return image;
-}
-
-torch::Tensor forwardChunked(LearnableParams &params, const Camera &cam, const int64_t start, const int64_t length)
-{
-    // slice each param (view, no copy)
-    auto alphas_raw   = params.alphas_raw.narrow(0, start, length);
-    auto scales_raw   = params.scales_raw.narrow(0, start, length);
-    auto rots_raw     = params.rots_raw.narrow(0, start, length);
-    auto low_shs_raw  = params.low_shs.narrow(0, start, length);
-    auto high_shs_raw = params.high_shs.narrow(0, start, length);
-    auto pws_chunk    = params.pws.narrow(0, start, length);
-
-    // same pipeline on chunk
-    auto alphas = getAlphas(alphas_raw);
-    auto scales = getScales(scales_raw);
-    auto rots   = getRots(rots_raw);
-    auto shs    = getShs(low_shs_raw, high_shs_raw);
-
-    torch::Tensor proj_us;
-    auto          points_cam = project(pws_chunk, cam, proj_us);
-    // auto          us         = proj_us.clone().detach().requires_grad_(true);
-    auto us = proj_us;
-
-    auto cov3d = computeCov3d(scales, rots);
-    auto cov2d = projectCov3dTo2d(points_cam, cam, cov3d);
-
-    auto colors = shToColor(shs, pws_chunk, cam.tcw);
-
-    torch::Tensor areas_3_sigma;
-    auto          cov2d_inv = inverseCov2d(cov2d, areas_3_sigma);
-
-    auto depths = points_cam.index({Slice(), 2});
-    // auto image  = splat(cam, us, cov2d_inv, alphas, depths, colors, areas_3_sigma);
-    auto image = splatTiled(cam, us, cov2d_inv, alphas, depths, colors, areas_3_sigma);
 
     return image;
 }
@@ -523,26 +325,25 @@ torch::Tensor forwardWithCulling(LearnableParams &params, const Camera &cam)
     auto rots   = getRots(params.rots_raw);
     auto shs    = getShs(params.low_shs, params.high_shs);
 
+    // 1) Project 3D gaussian centers to camera coordinates and image coordinates
     torch::Tensor proj_us;
     auto          points_cam = project(params.pws, cam, proj_us);
 
-    // 2) build your frustum mask (uses points_cam & scales to get radii)
+    // 2) Build frustum mask and filter out gaussians outside the frustum
     auto z = points_cam.index({Slice(), 2}); // [N]
     // Calculate normalized device coordinates
-    auto u_ndc = proj_us.index({Slice(), 0}) / cam.width * 2.F - 1.F;  // map to [-1, 1]
-    auto v_ndc = proj_us.index({Slice(), 1}) / cam.height * 2.F - 1.F; // map to [-1, 1]
-    auto radii = std::get<0>(scales.max(1, false)) * 3.0f;
-    std::cout << "radii: " << radii << std::endl;
+    auto u_ndc   = proj_us.index({Slice(), 0}) / cam.width * 2.F - 1.F;  // map to [-1, 1]
+    auto v_ndc   = proj_us.index({Slice(), 1}) / cam.height * 2.F - 1.F; // map to [-1, 1]
+    auto radii   = std::get<0>(scales.max(1, false)) * 3.0f;
     auto r_x_ndc = radii * (cam.fx / z) * (2.0f / cam.width); // radius in normalized image coordinates
     auto r_y_ndc = radii * (cam.fy / z) * (2.0f / cam.height);
     // Check if within the frustum
-    auto mask = (z > 0.2f) & (z < 100.f) & (u_ndc + r_x_ndc > -1) & (u_ndc - r_x_ndc < 1) & (v_ndc + r_y_ndc > -1) &
-                (v_ndc - r_y_ndc < 1);
-    auto idxs = mask.nonzero().squeeze(1); // [M]
-
+    auto frustum_cull_mask = (z > 0.2f) & (z < 100.f) & (u_ndc + r_x_ndc > -1) & (u_ndc - r_x_ndc < 1) &
+                             (v_ndc + r_y_ndc > -1) & (v_ndc - r_y_ndc < 1);
+    auto idxs = frustum_cull_mask.nonzero().squeeze(1); // [M]
     std::cout << "Survived Gaussians: " << idxs.size(0) << " / " << params.pws.size(0) << std::endl;
 
-    // 3) now slice *everything* you need for the heavy ops
+    // Pick the parameters of the surviving Gaussians (causes copy)
     auto pws_sel     = params.pws.index({idxs}); // [M,3]
     auto alphas_sel  = alphas.index({idxs});     // [M]
     auto scales_sel  = scales.index({idxs});     // [M,3]
@@ -550,22 +351,139 @@ torch::Tensor forwardWithCulling(LearnableParams &params, const Camera &cam)
     auto proj_us_sel = proj_us.index({idxs});    // [M,2]
     auto shs_sel     = shs.index({idxs});        // [M, sh_dim]
 
-    // 4) recompute only on M survivors
-    auto          cov3d_sel = computeCov3d(scales_sel, rots_sel);
-    auto          cov2d_sel = projectCov3dTo2d(points_cam.index({idxs}), cam, cov3d_sel);
+    // 3) Compute 3D covariance matrices for each gaussian
+    auto cov3d_sel = computeCov3d(scales_sel, rots_sel);
+    // 4) Project 3d gaussian to 2d
+    auto cov2d_sel = projectCov3dTo2d(points_cam.index({idxs}), cam, cov3d_sel);
+    // 5)  Compute colors via spherical harmonics
+    auto colors_sel = shToColor(shs_sel, pws_sel, cam.tcw);
+    // 6) Find 3 sigma areas gaussian would cover in image space
     torch::Tensor areas_sel;
-    auto          cinv_sel   = inverseCov2d(cov2d_sel, areas_sel);
-    auto          colors_sel = shToColor(shs_sel, pws_sel, cam.tcw);
-    auto          depths_sel = points_cam.index({idxs, 2});
+    auto          cinv_sel = inverseCov2d(cov2d_sel, areas_sel);
+    // 7) Splat gaussians to image space
+    auto depths_sel = points_cam.index({idxs, 2});
+    auto image      = splat(cam, proj_us_sel, cinv_sel, alphas_sel, depths_sel, colors_sel, areas_sel);
 
-    // 5) finally do your tiled splat on the M Gaussians
-    return splatTiled(cam,
-                      proj_us_sel, // now image coords
-                      cinv_sel,
-                      alphas_sel,
-                      depths_sel,
-                      colors_sel,
-                      areas_sel);
+    return image;
 }
+
+// torch::Tensor splatTiled(const Camera  &cam,
+//                          torch::Tensor &gaussian_2d_centers,
+//                          torch::Tensor &cov2d_inv,
+//                          torch::Tensor &alphas,
+//                          torch::Tensor &depths,
+//                          torch::Tensor &colors,
+//                          torch::Tensor &areas_3_sigma)
+// {
+//     auto          device = gaussian_2d_centers.device();
+//     auto          dtype  = gaussian_2d_centers.dtype();
+//     torch::Tensor image  = torch::zeros({cam.height, cam.width, 3}, torch::TensorOptions().device(device).dtype(dtype));
+
+//     // 1) Precompute each Gaussian's bbox in pixels
+//     const int num_gaussians = depths.size(0);
+
+//     std::vector<int> x0(num_gaussians), x1(num_gaussians), y0(num_gaussians), y1(num_gaussians);
+//     for (int gaus_idx = 0; gaus_idx < num_gaussians; ++gaus_idx)
+//     {
+//         float gx  = gaussian_2d_centers[gaus_idx][0].item<float>();
+//         float gy  = gaussian_2d_centers[gaus_idx][1].item<float>();
+//         int   rx  = areas_3_sigma[gaus_idx][0].item<int>();
+//         int   ry  = areas_3_sigma[gaus_idx][1].item<int>();
+//         int   _x0 = static_cast<int>(std::clamp(gx - rx, 0.F, static_cast<float>(cam.width)));
+//         int   _x1 = static_cast<int>(std::clamp(gx + rx, 0.F, static_cast<float>(cam.width)));
+//         int   _y0 = static_cast<int>(std::clamp(gy - ry, 0.F, static_cast<float>(cam.height)));
+//         int   _y1 = static_cast<int>(std::clamp(gy + ry, 0.F, static_cast<float>(cam.height)));
+//         if (_x1 > _x0 && _y1 > _y0)
+//         {
+//             x0[gaus_idx] = _x0;
+//             x1[gaus_idx] = _x1;
+//             y0[gaus_idx] = _y0;
+//             y1[gaus_idx] = _y1;
+//         }
+//         else
+//         {
+//             // Collapse the gaussian extent to zero
+//             x0[gaus_idx] = x1[gaus_idx] = y0[gaus_idx] = y1[gaus_idx] = 0;
+//         }
+//     }
+
+//     // 2) Bin (assign) Gaussians into 32×32 tiles
+//     constexpr int TW = 32;
+//     constexpr int TH = 32;
+
+//     const int                     num_tiles_x = (cam.width + TW - 1) / TW;
+//     const int                     num_tiles_y = (cam.height + TH - 1) / TH;
+//     std::vector<std::vector<int>> tiles(num_tiles_x * num_tiles_y);
+//     for (int gaus_idx = 0; gaus_idx < num_gaussians; ++gaus_idx)
+//     {
+//         if (x0[gaus_idx] == x1[gaus_idx] || y0[gaus_idx] == y1[gaus_idx])
+//             continue;
+//         // Calculate the tiles span by this gaussian (1 gaussian might span multiple tiles)
+//         int tx0 = x0[gaus_idx] / TW, tx1 = (x1[gaus_idx] - 1) / TW;
+//         int ty0 = y0[gaus_idx] / TH, ty1 = (y1[gaus_idx] - 1) / TH;
+//         for (int ty = ty0; ty <= ty1; ++ty)
+//             for (int tx = tx0; tx <= tx1; ++tx)
+//                 tiles[ty * num_tiles_x + tx].push_back(gaus_idx);
+//     }
+
+//     // 3) Process each non-empty tile in one batched Tensor-op
+//     auto mesh_grid_options = torch::TensorOptions().device(device).dtype(torch::kLong);
+//     for (int ty = 0; ty < num_tiles_y; ++ty)
+//     {
+//         for (int tx = 0; tx < num_tiles_x; ++tx)
+//         {
+//             auto &gaus_ids_this_tile = tiles[ty * num_tiles_x + tx];
+//             if (gaus_ids_this_tile.empty())
+//                 continue;
+
+//             // tile pixel bounds
+//             const int tile_y0     = ty * TH;
+//             const int tile_y1     = std::min((ty + 1) * TH, static_cast<int>(cam.height));
+//             const int tile_x0     = tx * TW;
+//             const int tile_x1     = std::min((tx + 1) * TW, static_cast<int>(cam.width));
+//             const int tile_height = tile_y1 - tile_y0;
+//             const int tile_width  = tile_x1 - tile_x0;
+
+//             // 3a) build meshgrid once
+//             auto ys    = torch::arange(tile_y0, tile_y1, mesh_grid_options);
+//             auto xs    = torch::arange(tile_x0, tile_x1, mesh_grid_options);
+//             auto sub_y = ys.view({tile_height, 1}).expand({tile_height, tile_width});
+//             auto sub_x = xs.view({1, tile_width}).expand({tile_height, tile_width});
+
+//             // 3b) gather all G params
+//             auto idx_tensor =
+//                 torch::tensor(gaus_ids_this_tile, torch::TensorOptions().dtype(torch::kLong).device(device));
+//             auto ctrs  = gaussian_2d_centers.index_select(0, idx_tensor); // [G,2]
+//             auto cinv  = cov2d_inv.index_select(0, idx_tensor);           // [G,3]
+//             auto a_i   = alphas.index_select(0, idx_tensor);              // [G]
+//             auto colsG = colors.index_select(0, idx_tensor);              // [G,3]
+
+//             // 3c) Mahalanobis batch
+//             auto gx   = ctrs.select(1, 0).unsqueeze(-1).unsqueeze(-1); // [G,1,1]
+//             auto gy   = ctrs.select(1, 1).unsqueeze(-1).unsqueeze(-1);
+//             auto d0   = sub_x.unsqueeze(0) - gx; // [G,H,W]
+//             auto d1   = sub_y.unsqueeze(0) - gy;
+//             auto c00  = cinv.select(1, 0).unsqueeze(-1).unsqueeze(-1);
+//             auto c01  = cinv.select(1, 1).unsqueeze(-1).unsqueeze(-1);
+//             auto c11  = cinv.select(1, 2).unsqueeze(-1).unsqueeze(-1);
+//             auto maha = c00 * (d0 * d0) + c11 * (d1 * d1) + 2.f * c01 * (d0 * d1);
+
+//             // 3d) alpha & color blend
+//             auto alpha = torch::exp(-0.5f * maha).unsqueeze(1) * a_i.view({-1, 1, 1, 1});
+//             auto col   = colsG.view({-1, 3, 1, 1});
+//             auto patch = alpha * col; // [G,3,H,W]
+
+//             // 3e) sum Gaussians → tile_patch [3,H,W]
+//             auto tile_patch = patch.sum(0);
+
+//             // 3f) write back
+//             image.slice(0, tile_y0, tile_y1)
+//                 .slice(1, tile_x0, tile_x1)
+//                 .add_(tile_patch.permute({1, 2, 0})); // → [H,W,3]
+//         }
+//     }
+
+//     return image;
+// }
 
 } // namespace gsplat

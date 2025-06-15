@@ -40,10 +40,12 @@ cv::Mat loadSingleImage(const std::string &im_path)
     return img;
 }
 
-torch::Tensor loadImageTensor(const std::string &im_path, torch::Device device)
+torch::Tensor
+loadImageTensor(const std::string &im_path, torch::Device device, const int64_t cam_width, const int64_t cam_height)
 {
     cv::Mat img = cv::imread(im_path, cv::IMREAD_COLOR);
     cv::cvtColor(img, img, cv::COLOR_BGR2RGB);
+    cv::resize(img, img, cv::Size(cam_width, cam_height), 0, 0, cv::INTER_LINEAR);
     // create tensor from H×W×C uint8
     auto tensor = torch::from_blob(img.data, {img.rows, img.cols, 3}, torch::kUInt8);
     // convert to C×H×W float on device, normalized [0,1]
@@ -111,7 +113,7 @@ Gaussians initGaussiansFrom3dPoints(const std::vector<colmap_loader::Point3D> &p
         static_cast<void>(findNearestDist);
         float nearest_dist = 0.1f;
         // Clip it to [0,01, 3]
-        nearest_dist = std::max(0.01f, std::min(3.0f, nearest_dist));
+        // nearest_dist = std::max(0.01f, std::min(3.0f, nearest_dist));
         // Use the nearest distance as isomorphic gaussian scale
         gaussians.scales.push_back({nearest_dist, nearest_dist, nearest_dist});
     }
@@ -130,8 +132,8 @@ class GsplatData
         auto ims  = colmap_loader::loadImages(dataset_path + "/sparse/0/images.bin");
         auto pts  = colmap_loader::loadPoints(dataset_path + "/sparse/0/points3D.bin");
 
-        std::cout << "Loaded: " << cams.size() << " cameras, " << ims.size() << " images, " << pts.size()
-                  << " points3D\n\n";
+        std::cout << "Loaded: " << cams.size() << " cameras, " << ims.size() << " images, " << pts.size() << " points3D"
+                  << std::endl;
         colmap_loader::summarize(cams, ims, pts);
 
         auto const  sample_img = loadSingleImage(dataset_path + "/images/" + ims[0].name);
@@ -154,7 +156,7 @@ class GsplatData
             cam.twc = -cam.Rcw.transpose(0, 1).matmul(cam.tcw.unsqueeze(1)).squeeze();
 
             cam.image_path          = dataset_path + "/images/" + im.name;
-            auto const image_tensor = loadImageTensor(cam.image_path, device_);
+            auto const image_tensor = loadImageTensor(cam.image_path, device_, cam.width, cam.height);
 
             images_.push_back(image_tensor);
             cameras_.push_back(cam);

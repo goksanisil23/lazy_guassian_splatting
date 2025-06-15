@@ -6,7 +6,6 @@ find_package(OpenCV REQUIRED)
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${TORCH_CXX_FLAGS}")
 set(COMPILER_FLAGS -Wall -std=c++17 -g -O2)
 
-################## Q-learning ################## 
 set(SRCS
     ${CMAKE_CURRENT_SOURCE_DIR}/main.cpp
 )
@@ -18,7 +17,6 @@ target_include_directories(gsplat SYSTEM PRIVATE
 )
 
 target_link_libraries(gsplat ${TORCH_LIBRARIES} ${OpenCV_LIBS} pthread dl rt)
-# target_link_directories(gsplat PRIVATE ${RAYLIB_LINK_DIR})
 
 target_include_directories(gsplat PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}

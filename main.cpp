@@ -65,34 +65,6 @@ LearnableParams createLearningParamsFromGaussians(const gsplat::Gaussians &gauss
     return params;
 }
 
-void stepChunked(LearnableParams         &params,
-                 const gsplat::Camera    &cam,
-                 torch::optim::Optimizer &optimizer,
-                 torch::Tensor           &image,
-                 torch::Tensor           &gt_image_tensor)
-{
-    // Chunked forward pass
-
-    constexpr int64_t kChunk = 8'000;
-    const int64_t     N      = params.pws.size(0);
-
-    for (int64_t i = 0; i < N; i += kChunk)
-    {
-        std::cout << "chunk " << i / kChunk << " / " << (N + kChunk - 1) / kChunk << std::endl;
-        const int64_t chunk_len = std::min(kChunk, N - i);
-        optimizer.zero_grad();
-        image.reset();
-
-        image = forwardChunked(params, cam, i, chunk_len).permute({2, 0, 1});
-
-        auto loss = gaussianLoss(image, gt_image_tensor);
-        loss.backward();
-        optimizer.step();
-
-        c10::cuda::CUDACachingAllocator::emptyCache();
-    }
-}
-
 void step(LearnableParams         &params,
           const gsplat::Camera    &cam,
           torch::optim::Optimizer &optimizer,
@@ -102,7 +74,6 @@ void step(LearnableParams         &params,
     optimizer.zero_grad();
     image.reset();
 
-    // image = forward(params, cam).permute({2, 0, 1}); // [H,W,C] -> [C,H,W]
     image = forwardWithCulling(params, cam).permute({2, 0, 1});
 
     auto loss = gaussianLoss(image, gt_image_tensor);
@@ -169,6 +140,7 @@ int main(int argc, char **argv)
                 auto image_cpu = image.detach().cpu().permute({1, 2, 0}).clamp(0, 1).mul(255).to(torch::kUInt8);
                 std::cout << "rendered image on cpu: " << image_cpu.sizes() << "\n";
                 cv::Mat img_mat(image_cpu.size(0), image_cpu.size(1), CV_8UC3, image_cpu.data_ptr());
+                cv::cvtColor(img_mat, img_mat, cv::COLOR_RGB2BGR);
                 cv::imwrite("rendered_image_epoch_" + std::to_string(epoch) + ".png", img_mat);
             }
             img_ctr++;

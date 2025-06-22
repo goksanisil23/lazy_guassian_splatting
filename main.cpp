@@ -74,11 +74,17 @@ void step(LearnableParams         &params,
     optimizer.zero_grad();
     image.reset();
 
-    image = forwardWithCulling(params, cam).permute({2, 0, 1});
+    auto t0 = std::chrono::high_resolution_clock::now();
+    image   = forwardWithCulling(params, cam).permute({2, 0, 1});
 
+    auto t1   = std::chrono::high_resolution_clock::now();
     auto loss = gaussianLoss(image, gt_image_tensor);
     loss.backward();
     optimizer.step();
+    auto t2 = std::chrono::high_resolution_clock::now();
+
+    std::cout << "forward: " << (t1 - t0).count() * 1e-6 << " ms, " << "backward: " << (t2 - t1).count() * 1e-6 << " ms"
+              << std::endl;
 
     c10::cuda::CUDACachingAllocator::emptyCache();
 }
@@ -132,7 +138,6 @@ int main(int argc, char **argv)
 
             torch::Tensor image;
             step(params, cam, optimizer, image, gt_image_tensor);
-            // stepChunked(params, cam, optimizer, image, gt_image_tensor);
 
             if (img_idx == 0)
             {

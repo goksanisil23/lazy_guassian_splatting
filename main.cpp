@@ -121,7 +121,17 @@ int main(int argc, char **argv)
     torch::optim::Adam optimizer(param_groups, torch::optim::AdamOptions(/*lr=*/0.F));
 
     // initialize the index map
-    gsplat::GLOBAL_IDX_MAP = makeIdxMap(data.cameras_[0].height, data.cameras_[0].width, data.device_);
+    // Find the max camera height and width, so that we have enough indices for all cameras
+    int64_t max_height = 0;
+    int64_t max_width  = 0;
+    for (const auto &cam : data.cameras_)
+    {
+        if (cam.height > max_height)
+            max_height = cam.height;
+        if (cam.width > max_width)
+            max_width = cam.width;
+    }
+    gsplat::GLOBAL_IDX_MAP = makeIdxMap(max_height, max_width, data.device_);
 
     const int64_t num_epochs = 300;
     for (int64_t epoch = 0; epoch < num_epochs; ++epoch)

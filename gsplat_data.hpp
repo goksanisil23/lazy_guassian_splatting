@@ -8,6 +8,9 @@
 
 namespace
 {
+
+constexpr float kScaleDownFactor = 4.0;
+
 torch::Tensor qVec2RotMat(const std::array<double, 4> &qvec)
 {
     float q0 = static_cast<float>(qvec[0]);
@@ -37,6 +40,8 @@ cv::Mat loadSingleImage(const std::string &im_path)
     {
         throw std::runtime_error("Failed to load image: " + im_path);
     }
+    // resize by downscale factor
+    cv::resize(img, img, cv::Size(), 1.0f / kScaleDownFactor, 1.0f / kScaleDownFactor, cv::INTER_LINEAR);
     return img;
 }
 
@@ -136,12 +141,15 @@ class GsplatData
                   << std::endl;
         colmap_loader::summarize(cams, ims, pts);
 
-        auto const  sample_img = loadSingleImage(dataset_path + "/images/" + ims[0].name);
-        const float w_scale    = sample_img.cols / static_cast<float>(cams[ims[0].camera_id].w);
-        const float h_scale    = sample_img.rows / static_cast<float>(cams[ims[0].camera_id].h);
-
         for (const colmap_loader::Image &im : ims)
         {
+            auto const  actual_img = loadSingleImage(dataset_path + "/images/" + im.name);
+            const float w_scale    = actual_img.cols / static_cast<float>(cams[im.camera_id].w);
+            const float h_scale    = actual_img.rows / static_cast<float>(cams[im.camera_id].h);
+
+            std::cout << "image size: " << actual_img.cols << " x " << actual_img.rows << ", w_scale: " << w_scale
+                      << ", h_scale: " << h_scale << std::endl;
+
             Camera cam;
             cam.id     = im.id;
             cam.width  = static_cast<int64_t>(static_cast<float>(cams[im.camera_id].w) * w_scale);

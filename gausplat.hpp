@@ -220,98 +220,6 @@ torch::Tensor inverseCov2d(const torch::Tensor &cov2d, torch::Tensor &areas_3_si
     return cov2d_inv;
 }
 
-torch::Tensor splat(const Camera  &cam,
-                    torch::Tensor &gaussian_2d_centers,
-                    torch::Tensor &cov2d_inv,
-                    torch::Tensor &alphas,
-                    torch::Tensor &depths,
-                    torch::Tensor &colors,
-                    torch::Tensor &areas_3_sigma)
-{
-    // Create an empty RGB image on the same device and dtype as the inputs:
-    auto          device = gaussian_2d_centers.device();
-    auto          dtype  = gaussian_2d_centers.dtype();
-    torch::Tensor image  = torch::zeros({cam.height, cam.width, 3}, torch::TensorOptions().device(device).dtype(dtype));
-    torch::Tensor image_T = torch::ones({cam.height, cam.width}, torch::TensorOptions().device(device).dtype(dtype));
-
-    // Sort indices by depth (ascending)
-    torch::Tensor depth_sorted_idxs = depths.argsort();
-    int64_t       num_gaussians     = depths.size(0);
-
-    for (int64_t k = 0; k < num_gaussians; ++k)
-    {
-        const int64_t idx = depth_sorted_idxs[k].item<int64_t>();
-        // Fetch scalar depth value
-        const float dpt = depths.index({idx}).item<float>();
-        if (dpt < 0.2f || dpt > 100.0f)
-        {
-            continue; // skip if out of valid depth range
-        }
-        // Fetch the 2D Gaussian center (gx, gy)
-        auto gaussian_2d_center = gaussian_2d_centers.index({idx});
-        auto gx_tensor          = gaussian_2d_center.index({0});
-        auto gy_tensor          = gaussian_2d_center.index({1});
-        // But we also need float values to compute integer bounds:
-        const float gx = gx_tensor.item<float>();
-        const float gy = gy_tensor.item<float>();
-
-        // Quickly cull if normalized center is out of ±1.3 range
-        if (std::abs(gx / cam.width) > 1.3f || std::abs(gy / cam.height) > 1.3f)
-        {
-            continue;
-        }
-
-        // Fetch the integer 3-sigma “radius” in pixels: [r_x, r_y]
-        int r_x = areas_3_sigma.index({idx, 0}).item<int>();
-        int r_y = areas_3_sigma.index({idx, 1}).item<int>();
-
-        // Compute bounding box [x0,x1) × [y0,y1) of this gaussian in image space, clamped
-        int x0 = static_cast<int>(std::clamp(gx - r_x, 0.0f, float(cam.width)));
-        int x1 = static_cast<int>(std::clamp(gx + r_x, 0.0f, float(cam.width)));
-        int y0 = static_cast<int>(std::clamp(gy - r_y, 0.0f, float(cam.height)));
-        int y1 = static_cast<int>(std::clamp(gy + r_y, 0.0f, float(cam.height)));
-
-        if (x1 <= x0 || y1 <= y0)
-        {
-            continue; // invalid patch
-        }
-
-        // Slice out the sub-region that this gaussian will affect from GLOBAL_IDX_MAP
-        auto sub_region = GLOBAL_IDX_MAP.index({
-            Slice(),       // both channels
-            Slice(y0, y1), // rows
-            Slice(x0, x1)  // cols
-        });
-        auto sub_x      = sub_region.index({0}); // [patch_h, patch_w], X‐coordinates
-        auto sub_y      = sub_region.index({1}); // [patch_h, patch_w], Y‐coordinates
-
-        // Pull out inverse-covariance scalars for this pixel: [c00, c01, c11]
-        auto cinv00 = cov2d_inv.index({idx, 0}); // 0-d Tensor
-        auto cinv01 = cov2d_inv.index({idx, 1}); // 0-d Tensor
-        auto cinv11 = cov2d_inv.index({idx, 2}); // 0-d Tensor
-
-        // Compute Mahalanobis distance using Tensors:
-        // d0 = (x - gx), d1 = (y - gy)
-        auto d0   = sub_x - gx_tensor; // [patch_h, patch_w], still in graph
-        auto d1   = sub_y - gy_tensor; // [patch_h, patch_w]
-        auto maha = cinv00 * (d0 * d0) + cinv11 * (d1 * d1) + 2.0f * cinv01 * (d0 * d1); // [patch_h, patch_w]
-
-        auto alpha       = alphas.index({idx});
-        auto patch_alpha = torch::exp(-0.5f * maha).mul(alpha).clamp_max(0.99f); // [dy,dx]
-        auto color       = colors.index({idx}).view({1, 1, 3});
-
-        auto roi            = image.slice(0, y0, y1).slice(1, x0, x1);
-        auto roi_T          = image_T.slice(0, y0, y1).slice(1, x0, x1);
-        auto T              = roi_T.clone();
-        auto weighted_alpha = patch_alpha * T;
-        auto patch          = weighted_alpha.unsqueeze(-1).mul(color);
-        roi.add_(patch);
-        roi_T.mul_(1.0f - patch_alpha);
-    }
-
-    return image;
-}
-
 torch::Tensor splatTiled(const Camera  &cam,
                          torch::Tensor &gaussian_2d_centers,
                          torch::Tensor &cov2d_inv,
@@ -320,18 +228,17 @@ torch::Tensor splatTiled(const Camera  &cam,
                          torch::Tensor &colors,
                          torch::Tensor &areas_3_sigma)
 {
-    // Create an empty RGB image on the same device and dtype as the inputs:
-    auto          device = gaussian_2d_centers.device();
-    auto          dtype  = gaussian_2d_centers.dtype();
-    torch::Tensor image  = torch::zeros({cam.height, cam.width, 3}, torch::TensorOptions().device(device).dtype(dtype));
-    torch::Tensor image_T = torch::ones({cam.height, cam.width}, torch::TensorOptions().device(device).dtype(dtype));
+    const auto device = gaussian_2d_centers.device();
+    const auto dtype  = gaussian_2d_centers.dtype();
+
+    // Output RGB
+    torch::Tensor image = torch::zeros({cam.height, cam.width, 3}, torch::TensorOptions().device(device).dtype(dtype));
 
     // Sort indices by depth (ascending)
     torch::Tensor depth_sorted_idxs = depths.argsort();
-    int64_t       num_gaussians     = depths.size(0);
+    const int64_t num_gaussians     = depths.size(0);
 
-    constexpr int TW{64}; // tile width
-    constexpr int TH{64}; // tile height
+    constexpr int TW = 64, TH = 64; // tile width & height
     const int     n_tiles_x = (cam.width + TW - 1) / TW;
     const int     n_tiles_y = (cam.height + TH - 1) / TH;
 
@@ -339,253 +246,116 @@ torch::Tensor splatTiled(const Camera  &cam,
     std::vector<std::vector<int32_t>> gaussians_in_tiles(n_tiles_x * n_tiles_y);
     for (int64_t k = 0; k < num_gaussians; ++k)
     {
-        // Should still iterate the gaussians based on depth priority, in each tile
-        const int64_t i = depth_sorted_idxs[k].item<int64_t>();
+        // In each tile, should iterate the gaussians based on depth priority
+        const auto i = depth_sorted_idxs[k].item<int64_t>();
 
         const auto  gaussian_2d_center = gaussian_2d_centers.index({i});
-        const float gx                 = gaussian_2d_center.index({0}).item<float>();
-        const float gy                 = gaussian_2d_center.index({1}).item<float>();
-        const int   r_x                = areas_3_sigma.index({i, 0}).item<int>();
-        const int   r_y                = areas_3_sigma.index({i, 1}).item<int>();
+        const float gaus_center_x      = gaussian_2d_center[0].item<float>();
+        const float gaus_center_y      = gaussian_2d_center[1].item<float>();
+        const int   rx                 = areas_3_sigma.index({i, 0}).item<int>();
+        const int   ry                 = areas_3_sigma.index({i, 1}).item<int>();
 
-        int x0  = std::max(0, int(std::floor(gx - r_x)));
-        int x1  = std::min(int(cam.width), int(std::ceil(gx + r_x)));
-        int y0  = std::max(0, int(std::floor(gy - r_y)));
-        int y1  = std::min(int(cam.height), int(std::ceil(gy + r_y)));
-        int tx0 = std::clamp(x0 / TW, 0, n_tiles_x - 1);
-        int tx1 = std::clamp((x1 - 1) / TW, 0, n_tiles_x - 1);
-        int ty0 = std::clamp(y0 / TH, 0, n_tiles_y - 1);
-        int ty1 = std::clamp((y1 - 1) / TH, 0, n_tiles_y - 1);
+        const int gaus_rect_x0 = std::max(0, static_cast<int>(std::floor(gaus_center_x - rx)));
+        const int gaus_rect_x1 = std::min(static_cast<int>(cam.width), static_cast<int>(std::ceil(gaus_center_x + rx)));
+        const int gaus_rect_y0 = std::max(0, static_cast<int>(std::floor(gaus_center_y - ry)));
+        const int gaus_rect_y1 =
+            std::min(static_cast<int>(cam.height), static_cast<int>(std::ceil(gaus_center_y + ry)));
 
-        // Assing the gaussian to the tiles it affects
+        if ((gaus_rect_x1 <= gaus_rect_x0) || (gaus_rect_y1 <= gaus_rect_y0))
+            continue;
+
+        // Assing the gaussian to the tiles it overlaps with
+        const int tx0 = std::clamp(gaus_rect_x0 / TW, 0, n_tiles_x - 1);
+        const int tx1 = std::clamp((gaus_rect_x1 - 1) / TW, 0, n_tiles_x - 1);
+        const int ty0 = std::clamp(gaus_rect_y0 / TH, 0, n_tiles_y - 1);
+        const int ty1 = std::clamp((gaus_rect_y1 - 1) / TH, 0, n_tiles_y - 1);
+
         for (int ty = ty0; ty <= ty1; ++ty)
             for (int tx = tx0; tx <= tx1; ++tx)
                 gaussians_in_tiles[ty * n_tiles_x + tx].push_back(static_cast<int32_t>(i));
     }
 
-    //--- process each tile
+    // --- Process each tile
     for (int ty = 0; ty < n_tiles_y; ++ty)
     {
-        const int y0_t = ty * TH;
-        const int y1_t = std::min(int(cam.height), y0_t + TH);
-        for (int tx = 0; tx < n_tiles_y; ++tx)
+        const int y0t = ty * TH;
+        const int y1t = std::min(static_cast<int>(cam.height), y0t + TH);
+
+        for (int tx = 0; tx < n_tiles_x; ++tx)
         {
-            const int x0_t = tx * TW;
-            const int x1_t = std::min(int(cam.width), x0_t + TW);
+            const int x0t = tx * TW;
+            const int x1t = std::min(static_cast<int>(cam.width), x0t + TW);
 
-            // ROI for this tile. Tiled gaussians will affect this region of the image only
-            auto roi   = image.slice(0, y0_t, y1_t).slice(1, x0_t, x1_t);
-            auto roi_T = image_T.slice(0, y0_t, y1_t).slice(1, x0_t, x1_t);
+            const int num_pixels_in_tile = (y1t - y0t) * (x1t - x0t);
+            const int tile_height        = y1t - y0t;
+            const int tile_width         = x1t - x0t;
 
-            // Iterate over the gaussians in this tile
-            for (int &gaus_idx : gaussians_in_tiles[ty * n_tiles_x + tx])
-            {
-                // Early bound checks
-                const float depth{depths.index({gaus_idx}).item<float>()};
-                if (depth < 0.2f || depth > 100.0f)
-                {
-                    continue;
-                }
-                auto        gaussian_2d_center = gaussian_2d_centers.index({gaus_idx});
-                const float gx                 = gaussian_2d_center[0].item<float>();
-                const float gy                 = gaussian_2d_center[1].item<float>();
-                if (std::abs(gx / cam.width) > 1.3f || std::abs(gy / cam.height) > 1.3f)
-                    continue;
-
-                const int rx = areas_3_sigma[gaus_idx][0].item<int>();
-                const int ry = areas_3_sigma[gaus_idx][1].item<int>();
-                // clamp patch to this tile
-                const int x0 = std::max(x0_t, int(std::floor(gx - rx)));
-                const int x1 = std::min(x1_t, int(std::ceil(gx + rx)));
-                const int y0 = std::max(y0_t, int(std::floor(gy - ry)));
-                const int y1 = std::min(y1_t, int(std::ceil(gy + ry)));
-
-                if (x1 <= x0 || y1 <= y0)
-                    continue;
-
-                auto sub_region = GLOBAL_IDX_MAP.index({Slice(), Slice(y0, y1), Slice(x0, x1)});
-                auto sub_x      = sub_region.index({0}); // [patch_h, patch_w], X‐coordinates
-                auto sub_y      = sub_region.index({1}); // [patch_h, patch_w], Y‐coordinates
-
-                // Pull out inverse-covariance scalars for this pixel: [c00, c01, c11]
-                auto cinv00 = cov2d_inv.index({gaus_idx, 0}); // 0-d Tensor
-                auto cinv01 = cov2d_inv.index({gaus_idx, 1}); // 0-d Tensor
-                auto cinv11 = cov2d_inv.index({gaus_idx, 2}); // 0-d Tensor
-
-                // Compute Mahalanobis distance using Tensors:
-                // d0 = (x - gx), d1 = (y - gy)
-                auto d0   = sub_x - gaussian_2d_center[0];                                       // [patch_h, patch_w]
-                auto d1   = sub_y - gaussian_2d_center[1];                                       // [patch_h, patch_w]
-                auto maha = cinv00 * (d0 * d0) + cinv11 * (d1 * d1) + 2.0f * cinv01 * (d0 * d1); // [patch_h, patch_w]
-
-                auto alpha       = alphas.index({gaus_idx});
-                auto patch_alpha = torch::exp(-0.5f * maha).mul(alpha).clamp_max(0.99f); // [dy,dx]
-                auto color       = colors.index({gaus_idx}).view({1, 1, 3});
-
-                auto T              = roi_T.slice(0, y0 - y0_t, y1 - y0_t).slice(1, x0 - x0_t, x1 - x0_t).clone();
-                auto weighted_alpha = patch_alpha * T;
-                auto patch          = weighted_alpha.unsqueeze(-1).mul(color);
-                // Adjust for the offset our gaussian has in the tile
-                roi.slice(0, y0 - y0_t, y1 - y0_t).slice(1, x0 - x0_t, x1 - x0_t).add_(patch);
-                roi_T.slice(0, y0 - y0_t, y1 - y0_t).slice(1, x0 - x0_t, x1 - x0_t).mul_(1.0f - patch_alpha);
-            }
-        }
-    }
-
-    return image;
-}
-
-torch::Tensor splatTiledBatched(const Camera  &cam,
-                                torch::Tensor &gaus_2d_centers,
-                                torch::Tensor &cov2d_inv,
-                                torch::Tensor &alphas,
-                                torch::Tensor &depths,
-                                torch::Tensor &colors,
-                                torch::Tensor &areas_3_sigma)
-{
-    auto device = gaus_2d_centers.device();
-    auto dtype  = gaus_2d_centers.dtype();
-
-    // Initialize output tensors
-    auto t_ops       = torch::TensorOptions().device(device).dtype(dtype);
-    auto t_ops_int32 = torch::TensorOptions().device(device).dtype(torch::kInt32);
-
-    torch::Tensor image   = torch::zeros({cam.height, cam.width, 3}, t_ops);
-    torch::Tensor image_T = torch::ones({cam.height, cam.width}, t_ops);
-
-    // Sort Gaussians by depth
-    torch::Tensor depth_sorted_idxs = depths.argsort();
-
-    constexpr int TW{64}; // Tile width
-    constexpr int TH{64}; // Tile height
-    const int     n_tiles_x = (cam.width + TW - 1) / TW;
-    const int     n_tiles_y = (cam.height + TH - 1) / TH;
-
-    // Precompute Gaussian tile assignments
-    at::GradMode::set_enabled(false);
-
-    const auto gaus_2d_centers_depth_sorted = gaus_2d_centers.index({depth_sorted_idxs}); // [N, 2]
-    const auto areas_depth_sorted           = areas_3_sigma.index({depth_sorted_idxs});   // [N, 2]
-
-    // Determine 2d gaussian boundaries, clamped to image bounds
-    const auto gaus_x_min = torch::max(
-        torch::floor(gaus_2d_centers_depth_sorted.index({Slice(), 0}) - areas_depth_sorted.index({Slice(), 0}))
-            .to(torch::kInt32),
-        torch::tensor({0}, t_ops_int32));
-    const auto gaus_x_max = torch::min(
-        torch::ceil(gaus_2d_centers_depth_sorted.index({Slice(), 0}) + areas_depth_sorted.index({Slice(), 0}))
-            .to(torch::kInt32),
-        torch::tensor({cam.width}, t_ops_int32));
-    const auto gaus_y_min = torch::max(
-        torch::floor(gaus_2d_centers_depth_sorted.index({Slice(), 1}) - areas_depth_sorted.index({Slice(), 1}))
-            .to(torch::kInt32),
-        torch::tensor({0}, t_ops_int32));
-    const auto gaus_y_max = torch::min(
-        torch::ceil(gaus_2d_centers_depth_sorted.index({Slice(), 1}) + areas_depth_sorted.index({Slice(), 1}))
-            .to(torch::kInt32),
-        torch::tensor({cam.height}, t_ops_int32));
-
-    // Determine tile indices for each Gaussian, clamped w.r.t number of tiles
-    auto gaus_tile_x_idx_min = torch::clamp(gaus_x_min.floor_divide(TW), 0, n_tiles_x - 1);
-    auto gaus_tile_x_idx_max = torch::clamp((gaus_x_max - 1).floor_divide(TW), 0, n_tiles_x - 1);
-    auto gaus_tile_y_idx_min = torch::clamp(gaus_y_min.floor_divide(TH), 0, n_tiles_y - 1);
-    auto gaus_tile_y_idx_max = torch::clamp((gaus_y_max - 1).floor_divide(TH), 0, n_tiles_y - 1);
-
-    at::GradMode::set_enabled(true);
-
-    // Process each tile
-    for (int tile_y_idx = 0; tile_y_idx < n_tiles_y; ++tile_y_idx)
-    {
-        const int tile_y_min = tile_y_idx * TH;
-        const int tile_y_max = std::min(int(cam.height), tile_y_min + TH);
-        const int H{tile_y_max - tile_y_min};
-        for (int tile_x_idx = 0; tile_x_idx < n_tiles_x; ++tile_x_idx)
-        {
-            const int tile_x_min = tile_x_idx * TW;
-            const int tile_x_max = std::min(int(cam.width), tile_x_min + TW);
-            const int W{tile_x_max - tile_x_min};
-
-            // Find Gaussians covering this tile
-            auto gaus_area_tile_overlap_mask =
-                (gaus_tile_x_idx_min <= tile_x_idx) & (gaus_tile_x_idx_max >= tile_x_idx) &
-                (gaus_tile_y_idx_min <= tile_y_idx) & (gaus_tile_y_idx_max >= tile_y_idx);
-            auto      gaus_ids_in_this_tile = depth_sorted_idxs.masked_select(gaus_area_tile_overlap_mask);
-            const int num_gaus_in_this_tile{gaus_ids_in_this_tile.size(0)};
-            if (num_gaus_in_this_tile == 0)
+            auto &gaus_ids_in_this_tile_vec = gaussians_in_tiles[ty * n_tiles_x + tx];
+            if (gaus_ids_in_this_tile_vec.empty())
                 continue;
 
-            // Tile coordinates
-            at::GradMode::set_enabled(false);
-            const auto sub_region =
-                GLOBAL_IDX_MAP.index({Slice(), Slice(tile_y_min, tile_y_max), Slice(tile_x_min, tile_x_max)});
-            const auto tile_x = sub_region.index({0});
-            const auto tile_y = sub_region.index({1});
-            at::GradMode::set_enabled(true);
+            // Convert indices to Tensor
+            torch::Tensor gaus_ids_in_this_tile =
+                torch::from_blob(gaus_ids_in_this_tile_vec.data(),
+                                 {static_cast<int64_t>(gaus_ids_in_this_tile_vec.size())},
+                                 torch::TensorOptions().dtype(torch::kInt32))
+                    .to(device)
+                    .to(torch::kLong)
+                    .clone();
 
-            // Select gaussians covering this tile
-            auto gaus_2d_centers_tile = gaus_2d_centers.index({gaus_ids_in_this_tile}).to(torch::kHalf); // [G, 2]
-            auto cov2d_inv_tile       = cov2d_inv.index({gaus_ids_in_this_tile}).to(torch::kHalf);       // [G, 3]
-            auto alphas_tile          = alphas.index({gaus_ids_in_this_tile}).to(torch::kHalf);          // [G]
-            auto colors_tile          = colors.index({gaus_ids_in_this_tile}).to(torch::kHalf);          // [G, 3]
-            auto areas_tile           = areas_3_sigma.index({gaus_ids_in_this_tile}).to(torch::kHalf);   // [G, 2]
+            // Gather Gaussian attributes (NOTE: index_select copies data)
+            torch::Tensor means2D               = gaussian_2d_centers.index_select(0, gaus_ids_in_this_tile);
+            torch::Tensor cinv                  = cov2d_inv.index_select(0, gaus_ids_in_this_tile);
+            torch::Tensor opacity               = alphas.index_select(0, gaus_ids_in_this_tile);
+            torch::Tensor colors_tile           = colors.index_select(0, gaus_ids_in_this_tile);
+            const int64_t num_gaussians_in_tile = gaus_ids_in_this_tile.size(0);
 
-            // Compute bounding boxes of gaussians within the tile
-            at::GradMode::set_enabled(false);
-            const auto gaus_x0_coord =
-                torch::max(torch::floor(gaus_2d_centers_tile.index({Slice(), 0}) - areas_tile.index({Slice(), 0})),
-                           torch::tensor({static_cast<float>(tile_x_min)}, t_ops));
-            const auto gaus_x1_coord =
-                torch::min(torch::ceil(gaus_2d_centers_tile.index({Slice(), 0}) + areas_tile.index({Slice(), 0})),
-                           torch::tensor({static_cast<float>(tile_x_max)}, t_ops));
-            const auto gaus_y0_coord =
-                torch::max(torch::floor(gaus_2d_centers_tile.index({Slice(), 1}) - areas_tile.index({Slice(), 1})),
-                           torch::tensor({static_cast<float>(tile_y_min)}, t_ops));
-            const auto gaus_y1_coord =
-                torch::min(torch::ceil(gaus_2d_centers_tile.index({Slice(), 1}) + areas_tile.index({Slice(), 1})),
-                           torch::tensor({static_cast<float>(tile_y_max)}, t_ops));
+            // Pixel grid for this tile
+            // [2, tile_height, tile_width]
+            auto sub_region = GLOBAL_IDX_MAP.index({Slice(), Slice(y0t, y1t), Slice(x0t, x1t)});
+            // Reshape to [num_pixels_in_tile, 2]
+            torch::Tensor tile_xy = sub_region.permute({1, 2, 0}).reshape({num_pixels_in_tile, 2}).to(dtype);
 
-            // Create bounding box mask
-            const auto tile_x_coords       = tile_x.view({1, H, W});         // [1, H, W]
-            const auto tile_y_coords       = tile_y.view({1, H, W});         // [1, H, W]
-            const auto gaus_x0_coord_broad = gaus_x0_coord.view({-1, 1, 1}); // [G, 1, 1]
-            const auto gaus_x1_coord_broad = gaus_x1_coord.view({-1, 1, 1});
-            const auto gaus_y0_coord_broad = gaus_y0_coord.view({-1, 1, 1});
-            const auto gaus_y1_coord_broad = gaus_y1_coord.view({-1, 1, 1});
-            const auto mask_bb = ((tile_x_coords >= gaus_x0_coord_broad) & (tile_x_coords < gaus_x1_coord_broad) &
-                                  (tile_y_coords >= gaus_y0_coord_broad) & (tile_y_coords < gaus_y1_coord_broad))
-                                     .to(torch::kHalf);
-            at::GradMode::set_enabled(true);
+            // Gaussian's weight per pixel: Difference between the tile coordinates and the gaussian centers
+            // [num_pixels_in_tile, num_gaussians_in_tile] = [num_pixels_in_tile, 1] - [1, num_gaussians_in_tile]
+            torch::Tensor dx = tile_xy.index({Slice(), 0}).unsqueeze(1) - means2D.index({Slice(), 0}).unsqueeze(0);
+            torch::Tensor dy = tile_xy.index({Slice(), 1}).unsqueeze(1) - means2D.index({Slice(), 1}).unsqueeze(0);
 
-            // Compute differences for Mahalanobis distance
-            auto       gx = gaus_2d_centers_tile.select(1, 0).unsqueeze(-1).unsqueeze(-1); // [G,1,1]
-            auto       gy = gaus_2d_centers_tile.select(1, 1).unsqueeze(-1).unsqueeze(-1); // [G,1,1]
-            const auto d0 = (tile_x_coords - gx).to(torch::kHalf);                         // [G, H, W]
-            const auto d1 = (tile_y_coords - gy).to(torch::kHalf);                         // [G, H, W]
+            torch::Tensor c00 = cinv.index({Slice(), 0}).unsqueeze(0);
+            torch::Tensor c01 = cinv.index({Slice(), 1}).unsqueeze(0);
+            torch::Tensor c11 = cinv.index({Slice(), 2}).unsqueeze(0);
 
-            // Compute Mahalanobis distance
-            auto cinv00 = cov2d_inv_tile.index({Slice(), 0}).view({-1, 1, 1}).to(torch::kHalf); // [G, 1, 1]
-            auto cinv01 = cov2d_inv_tile.index({Slice(), 1}).view({-1, 1, 1}).to(torch::kHalf);
-            auto cinv11 = cov2d_inv_tile.index({Slice(), 2}).view({-1, 1, 1}).to(torch::kHalf);
-            auto maha   = cinv00 * d0 * d0 + 2 * cinv01 * d0 * d1 + cinv11 * d1 * d1; // [G, H, W]
+            // The Gaussian density for a pixel at offset x=(dx,dy) is:
+            // w = exp(-0.5 * x^t * Cinv * x)
+            // x^t * Cinv * x = dx^2 * c00 + dy^2 * c11 + 2*dx*dy*c01
+            // [num_pixels_in_tile, num_gaussians_in_tile]
+            torch::Tensor quad = dx.mul(dx).mul(c00) + dy.mul(dy).mul(c11) + dx.mul(dy).mul(2.0).mul(c01);
 
-            // Compute alpha with masking
-            auto alphas_tile_broad = alphas_tile.view({-1, 1, 1});                                   // [G, 1, 1]
-            auto patch_alpha       = (torch::exp(-0.5 * maha) * alphas_tile_broad).to(torch::kHalf); // [G, H, W]
-            patch_alpha            = patch_alpha * mask_bb; // Zero outside bounding box
-            patch_alpha            = torch::clamp(patch_alpha, 0.0f, 0.99f);
+            // α = exp(-0.5*quad) * opacity
+            torch::Tensor opacity_view      = opacity.view({1, num_gaussians_in_tile});
+            torch::Tensor opacity_broadcast = opacity_view.expand({num_pixels_in_tile, num_gaussians_in_tile});
+            // [num_pixels_in_tile, num_gaussians_in_tile]
+            torch::Tensor alpha = torch::exp(-0.5 * quad).mul(opacity_broadcast).clamp_max(0.99);
 
-            // // Accumulate contributions
-            auto T_after  = torch::cumprod(1.0f - patch_alpha, 0); // [G, H, W]
-            auto T_before = torch::cat(
-                {torch::ones_like(patch_alpha.slice(0, 0, 1)), T_after.slice(0, 0, num_gaus_in_this_tile - 1)},
-                0);                                                                                      // [G, H, W]
-            auto contrib     = (patch_alpha * T_before).unsqueeze(-1) * colors_tile.view({-1, 1, 1, 3}); // [G, H, W, 3]
-            auto final_color = contrib.sum(0);                                                           // [H, W, 3]
-            auto final_T     = T_after.select(0, num_gaus_in_this_tile - 1);                             // [H, W]
+            // Calculate exclusive transmittence: Each gaussian's color contribution is weighted by
+            // transmittence of all the layers in front of it, but not itself
+            // T_j = prod_{k<j} (1 - α_k)
 
-            // Update image
-            image.index_put_({Slice(tile_y_min, tile_y_max), Slice(tile_x_min, tile_x_max)}, final_color);
-            image_T.index_put_({Slice(tile_y_min, tile_y_max), Slice(tile_x_min, tile_x_max)}, final_T);
+            // T_before_roll = [[t0, t1, t2, t3]]
+            // T_after_roll = [[t3, t0, t1, t2]]
+            // T_final = [[1, t0, t1, t2]]
+            torch::Tensor one_minus = 1.0 - alpha;                  // [num_pixels_in_tile, num_gaussians_in_tile]
+            torch::Tensor T         = torch::cumprod(one_minus, 1); // inclusive transmittence
+            T                       = torch::roll(T, /*shifts=*/{1}, /*dims=*/{1}); // circular shift right by 1
+            T.index_put_({Slice(), 0}, 1.0); // fix first col to 1 for exclusivity
+            // T = [num_pixels_in_tile, num_gaussians_in_tile]
+
+            // Color accumulation
+            torch::Tensor weights  = T * alpha;                           // [num_pixels_in_tile, num_gaussians_in_tile]
+            torch::Tensor tile_col = torch::matmul(weights, colors_tile); // [num_pixels_in_tile,3]
+
+            // Write back
+            image.index_put_({Slice(y0t, y1t), Slice(x0t, x1t), Slice()}, tile_col.view({tile_height, tile_width, 3}));
         }
     }
 
@@ -637,12 +407,9 @@ torch::Tensor forwardWithCulling(LearnableParams &params, const Camera &cam)
     auto          cinv_culled = inverseCov2d(cov2d_culled, areas_culled);
     // 7) Splat gaussians to image space
     auto depths_culled = gaus_centers_cam_frame.index({culled_gaus_ids, 2});
-    // auto image         = splat(
-    //     cam, gaus_centers_img_frame_culled, cinv_culled, alphas_culled, depths_culled, colors_culled, areas_culled);
+
     auto image = splatTiled(
         cam, gaus_centers_img_frame_culled, cinv_culled, alphas_culled, depths_culled, colors_culled, areas_culled);
-    // auto image = splatTiledBatched(
-    // cam, gaus_centers_img_frame_culled, cinv_culled, alphas_culled, depths_culled, colors_culled, areas_culled);
 
     return image;
 }

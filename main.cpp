@@ -133,8 +133,9 @@ int main(int argc, char **argv)
     }
     gsplat::GLOBAL_IDX_MAP = makeIdxMap(max_height, max_width, data.device_);
 
-    const int64_t num_epochs = 300;
-    for (int64_t epoch = 0; epoch < num_epochs; ++epoch)
+    constexpr int64_t kNumEpochs      = 100;
+    constexpr size_t  kImageIdxToShow = 0U;
+    for (int64_t epoch = 0; epoch < kNumEpochs; ++epoch)
     {
         auto const shuffled_img_indices = generateShuffledIndices(data.images_.size());
 
@@ -149,7 +150,7 @@ int main(int argc, char **argv)
             torch::Tensor image;
             step(params, cam, optimizer, image, gt_image_tensor);
 
-            if (img_idx == 0)
+            if (img_idx == kImageIdxToShow)
             {
                 // Show the image by copying it to CPU and converting to uint8_t
                 auto image_cpu = image.detach().cpu().permute({1, 2, 0}).clamp(0, 1).mul(255).to(torch::kUInt8);

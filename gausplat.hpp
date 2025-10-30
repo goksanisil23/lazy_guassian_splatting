@@ -35,6 +35,8 @@ torch::Tensor project(torch::Tensor &points_world, const Camera &cam, torch::Ten
     torch::Tensor y = points_cam.index({torch::indexing::Slice(), 1});
     torch::Tensor z = points_cam.index({torch::indexing::Slice(), 2});
 
+    // u = fx * x / z + cx
+    // v = fy * y / z + cy
     torch::Tensor u_x = x.mul(cam.fx).div(z).add(cam.cx);
     torch::Tensor u_y = y.mul(cam.fy).div(z).add(cam.cy);
 
@@ -45,9 +47,9 @@ torch::Tensor project(torch::Tensor &points_world, const Camera &cam, torch::Ten
 
 torch::Tensor computeCov3d(const torch::Tensor &scale, const torch::Tensor &rot)
 {
-    int64_t batch  = scale.size(0);
-    auto    device = scale.device();
-    auto    dtype  = scale.scalar_type();
+    const int64_t batch  = scale.size(0);
+    auto const    device = scale.device();
+    auto const    dtype  = scale.scalar_type();
 
     // Build diagonal scale matrix S: shape [batch, 3, 3]
     auto S = torch::zeros({batch, 3, 3}, torch::TensorOptions().device(device).dtype(dtype));
@@ -81,7 +83,6 @@ torch::Tensor computeCov3d(const torch::Tensor &scale, const torch::Tensor &rot)
     auto M     = torch::bmm(R, S);
     auto Sigma = torch::bmm(M, M.transpose(1, 2));
 
-    // return upperTriangular(Sigma);
     return Sigma;
 }
 
@@ -92,10 +93,10 @@ torch::Tensor projectCov3dTo2d(const torch::Tensor &points_cam, const Camera &ca
     auto z = points_cam.index({Slice(), 2}); // [batch]
 
     // Compute field‐of‐view limits
-    float tan_fovx = 2.0f * std::atan(cam.width / (2.0f * cam.fx));
-    float tan_fovy = 2.0f * std::atan(cam.height / (2.0f * cam.fy));
-    float limx     = 1.3f * tan_fovx;
-    float limy     = 1.3f * tan_fovy;
+    const float tan_fovx = 2.0f * std::atan(cam.width / (2.0f * cam.fx));
+    const float tan_fovy = 2.0f * std::atan(cam.height / (2.0f * cam.fy));
+    const float limx     = 1.3f * tan_fovx;
+    const float limy     = 1.3f * tan_fovy;
 
     auto inv_z_x = x.div(z);
     inv_z_x      = torch::clamp(inv_z_x, -limx, limx);
@@ -104,9 +105,9 @@ torch::Tensor projectCov3dTo2d(const torch::Tensor &points_cam, const Camera &ca
     inv_z_y      = torch::clamp(inv_z_y, -limy, limy);
     y            = inv_z_y.mul(z);
 
-    int64_t batch  = points_cam.size(0);
-    auto    device = points_cam.device();
-    auto    dtype  = points_cam.scalar_type();
+    const int64_t batch  = points_cam.size(0);
+    const auto    device = points_cam.device();
+    const auto    dtype  = points_cam.scalar_type();
 
     // Build Jacobian J: [batch, 3, 3], initialized to zeros
     auto J = torch::zeros({batch, 3, 3}, torch::TensorOptions().device(device).dtype(dtype));
@@ -127,10 +128,11 @@ torch::Tensor projectCov3dTo2d(const torch::Tensor &points_cam, const Camera &ca
 
     // inflate x & y variance by 0.3
     {
-        auto diag00 = Sigma_prime.index({Slice(), 0, 0});
-        Sigma_prime.index_put_({Slice(), 0, 0}, diag00 + 0.3f);
+        constexpr float kInflation = 0.3F;
+        auto            diag00     = Sigma_prime.index({Slice(), 0, 0});
+        Sigma_prime.index_put_({Slice(), 0, 0}, diag00 + kInflation);
         auto diag11 = Sigma_prime.index({Slice(), 1, 1});
-        Sigma_prime.index_put_({Slice(), 1, 1}, diag11 + 0.3f);
+        Sigma_prime.index_put_({Slice(), 1, 1}, diag11 + kInflation);
     }
 
     // Extract the top‐left 2×2 block:
@@ -138,12 +140,12 @@ torch::Tensor projectCov3dTo2d(const torch::Tensor &points_cam, const Camera &ca
     return upperTriangular(Sigma2d);
 }
 
-torch::Tensor shToColor(torch::Tensor       &sh, // [batch, sh_dim]
-                        torch::Tensor       &pw, // [batch, 3]
+torch::Tensor shToColor(const torch::Tensor &sh, // [batch, sh_dim]
+                        const torch::Tensor &pw, // [batch, 3]
                         const torch::Tensor &twc // [batch, 3]
 )
 {
-    int64_t sh_dim = sh.size(1);
+    const int64_t sh_dim = sh.size(1);
 
     auto color = SH_C0_0 * sh.index({Slice(), Slice(0, 3)}) + 0.5;
     if (sh_dim <= 3)
@@ -154,9 +156,9 @@ torch::Tensor shToColor(torch::Tensor       &sh, // [batch, sh_dim]
     auto ray_dir = pw - twc; // [batch, 3]
     ray_dir      = ray_dir / ray_dir.norm(2, /*dim=*/1, /*keepdim=*/true);
 
-    auto x = ray_dir.index({Slice(), Slice(0, 1)}); // [batch,1]
-    auto y = ray_dir.index({Slice(), Slice(1, 2)}); // [batch,1]
-    auto z = ray_dir.index({Slice(), Slice(2, 3)}); // [batch,1]
+    const auto x = ray_dir.index({Slice(), Slice(0, 1)}); // [batch,1]
+    const auto y = ray_dir.index({Slice(), Slice(1, 2)}); // [batch,1]
+    const auto z = ray_dir.index({Slice(), Slice(2, 3)}); // [batch,1]
 
     color = color + SH_C1_0 * (y * sh.index({Slice(), Slice(3, 6)})) +
             SH_C1_1 * (z * sh.index({Slice(), Slice(6, 9)})) + SH_C1_2 * (x * sh.index({Slice(), Slice(9, 12)}));
@@ -166,12 +168,12 @@ torch::Tensor shToColor(torch::Tensor       &sh, // [batch, sh_dim]
     }
 
     // compute second‐order terms
-    auto xx = x * x; // [batch,1]
-    auto yy = y * y;
-    auto zz = z * z;
-    auto xy = x * y;
-    auto yz = y * z;
-    auto xz = x * z;
+    const auto xx = x * x; // [batch,1]
+    const auto yy = y * y;
+    const auto zz = z * z;
+    const auto xy = x * y;
+    const auto yz = y * z;
+    const auto xz = x * z;
 
     color = color + SH_C2_0 * (xy * sh.index({Slice(), Slice(12, 15)})) +
             SH_C2_1 * (yz * sh.index({Slice(), Slice(15, 18)})) +
@@ -238,22 +240,30 @@ torch::Tensor splatTiled(const Camera  &cam,
     torch::Tensor depth_sorted_idxs = depths.argsort();
     const int64_t num_gaussians     = depths.size(0);
 
-    constexpr int TW = 64, TH = 64; // tile width & height
+    // constexpr int TW = 64, TH = 64; // tile width & height
+    constexpr int TW = 32, TH = 32; // tile width & height
     const int     n_tiles_x = (cam.width + TW - 1) / TW;
     const int     n_tiles_y = (cam.height + TH - 1) / TH;
 
     // Precompute which gaussians belong to which tiles
     std::vector<std::vector<int32_t>> gaussians_in_tiles(n_tiles_x * n_tiles_y);
+    // Copy data needed for precomputation to CPU
+    auto const depth_sorted_idxs_cpu   = depth_sorted_idxs.to(torch::kCPU);
+    const auto gaussian_2d_centers_cpu = gaussian_2d_centers.to(torch::kCPU);
+    const auto areas_3_sigma_cpu       = areas_3_sigma.to(torch::kCPU);
+
+    const auto *depth_sorted_idxs_ptr   = depth_sorted_idxs_cpu.data_ptr<int64_t>();
+    const auto *gaussian_2d_centers_ptr = gaussian_2d_centers_cpu.data_ptr<float>();
+    const auto *areas_3_sigma_ptr       = areas_3_sigma_cpu.data_ptr<int32_t>();
     for (int64_t k = 0; k < num_gaussians; ++k)
     {
         // In each tile, should iterate the gaussians based on depth priority
-        const auto i = depth_sorted_idxs[k].item<int64_t>();
+        const auto i = depth_sorted_idxs_ptr[k];
 
-        const auto  gaussian_2d_center = gaussian_2d_centers.index({i});
-        const float gaus_center_x      = gaussian_2d_center[0].item<float>();
-        const float gaus_center_y      = gaussian_2d_center[1].item<float>();
-        const int   rx                 = areas_3_sigma.index({i, 0}).item<int>();
-        const int   ry                 = areas_3_sigma.index({i, 1}).item<int>();
+        const float gaus_center_x = gaussian_2d_centers_ptr[i * 2 + 0];
+        const float gaus_center_y = gaussian_2d_centers_ptr[i * 2 + 1];
+        const int   rx            = areas_3_sigma_ptr[i * 2 + 0];
+        const int   ry            = areas_3_sigma_ptr[i * 2 + 1];
 
         const int gaus_rect_x0 = std::max(0, static_cast<int>(std::floor(gaus_center_x - rx)));
         const int gaus_rect_x1 = std::min(static_cast<int>(cam.width), static_cast<int>(std::ceil(gaus_center_x + rx)));
@@ -373,7 +383,7 @@ torch::Tensor forwardWithCulling(LearnableParams &params, const Camera &cam)
     torch::Tensor gaus_centers_img_frame;
     auto          gaus_centers_cam_frame = project(params.pws, cam, gaus_centers_img_frame);
 
-    // 2) Build frustum mask and filter out gaus_ outside the frustum
+    // 2) Build frustum mask and filter out gaussians outside the frustum
     auto z = gaus_centers_cam_frame.index({Slice(), 2}); // [N]
     // Calculate normalized device coordinates of the gaussian centers in the image frame
     auto u_ndc    = gaus_centers_img_frame.index({Slice(), 0}) / cam.width * 2.F - 1.F;  // map to [-1, 1]
@@ -382,7 +392,9 @@ torch::Tensor forwardWithCulling(LearnableParams &params, const Camera &cam)
     auto r_x_ndc  = radii_3d * (cam.fx / z) / cam.width * 2.0f; // radius in normalized image coordinates
     auto r_y_ndc  = radii_3d * (cam.fy / z) / cam.height * 2.0f;
     // Check if within the camera frustum (6 sides)
-    auto frustum_cull_mask = (z > 0.2f) & (z < 100.f) & (u_ndc + r_x_ndc > -1) & (u_ndc - r_x_ndc < 1) &
+    constexpr float kNearClip = 0.2F;
+    constexpr float kFarClip  = 100.0F;
+    auto frustum_cull_mask    = (z > kNearClip) & (z < kFarClip) & (u_ndc + r_x_ndc > -1) & (u_ndc - r_x_ndc < 1) &
                              (v_ndc + r_y_ndc > -1) & (v_ndc - r_y_ndc < 1);
     auto culled_gaus_ids = frustum_cull_mask.nonzero().squeeze(1); // [M]
     std::cout << "Survived Gaussians after Frustum Culling: " << culled_gaus_ids.size(0) << " / " << params.pws.size(0)

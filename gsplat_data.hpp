@@ -9,7 +9,7 @@
 namespace
 {
 
-constexpr float kScaleDownFactor = 4.0;
+constexpr float kScaleDownFactor = 2.0;
 
 torch::Tensor qVec2RotMat(const std::array<double, 4> &qvec)
 {
@@ -173,15 +173,15 @@ class GsplatData
         gaussians_ = initGaussiansFrom3dPoints(pts);
 
         // TODO: (Remove) Limit the data
-        // {
-        //     gaussians_.pws.resize(50000);
-        //     gaussians_.shs.resize(50000);
-        //     gaussians_.scales.resize(50000);
-        //     gaussians_.rots.resize(50000);
-        //     gaussians_.alphas.resize(50000);
-        //     images_.resize(10);
-        //     cameras_.resize(10);
-        // }
+        {
+            gaussians_.pws.resize(10000);
+            gaussians_.shs.resize(10000);
+            gaussians_.scales.resize(10000);
+            gaussians_.rots.resize(10000);
+            gaussians_.alphas.resize(10000);
+            images_.resize(10);
+            cameras_.resize(10);
+        }
     }
 
   public:

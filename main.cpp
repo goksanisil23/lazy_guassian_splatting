@@ -1,3 +1,4 @@
+#include "adaptive_densification.hpp"
 #include "gausplat.hpp"
 #include "gsplat_data.hpp"
 #include "ssim.hpp"
@@ -5,7 +6,6 @@
 #include "utils.hpp"
 
 #include <algorithm>
-#include <c10/cuda/CUDACachingAllocator.h>
 #include <fstream>
 #include <numeric>
 #include <random>
@@ -68,25 +68,30 @@ LearnableParams createLearningParamsFromGaussians(const gsplat::Gaussians &gauss
 void step(LearnableParams         &params,
           const gsplat::Camera    &cam,
           torch::optim::Optimizer &optimizer,
+          GradAccumInfo           &grad_accum_info,
           torch::Tensor           &image,
           torch::Tensor           &gt_image_tensor)
 {
     optimizer.zero_grad();
     image.reset();
 
-    auto t0 = std::chrono::high_resolution_clock::now();
-    image   = forwardWithCulling(params, cam).permute({2, 0, 1});
+    constexpr float kGradAccumDepthThresh = 0.2F;
 
-    auto t1   = std::chrono::high_resolution_clock::now();
-    auto loss = gaussianLoss(image, gt_image_tensor);
+    auto          t0 = std::chrono::high_resolution_clock::now();
+    torch::Tensor depths_in_cam_frame;
+    torch::Tensor gaus_centers_img_frame = torch::zeros(
+        {params.pws.sizes()[0], 2}, torch::TensorOptions().device(params.pws.device()).dtype(torch::kFloat32));
+    image = forwardWithCulling(params, cam, depths_in_cam_frame, gaus_centers_img_frame).permute({2, 0, 1});
+    auto const grad_accum_mask = depths_in_cam_frame.gt(kGradAccumDepthThresh);
+    auto       t1              = std::chrono::high_resolution_clock::now();
+    auto       loss            = gaussianLoss(image, gt_image_tensor);
     loss.backward();
+    updateAccumulatedGradInfo(grad_accum_info, gaus_centers_img_frame, grad_accum_mask);
     optimizer.step();
     auto t2 = std::chrono::high_resolution_clock::now();
 
     std::cout << "forward: " << (t1 - t0).count() * 1e-6 << " ms, " << "backward: " << (t2 - t1).count() * 1e-6 << " ms"
               << std::endl;
-
-    c10::cuda::CUDACachingAllocator::emptyCache();
 }
 
 int main(int argc, char **argv)
@@ -100,25 +105,8 @@ int main(int argc, char **argv)
     gsplat::GsplatData data(dir);
 
     auto params = createLearningParamsFromGaussians(data.gaussians_, data.device_);
-
-    AdamsParams adams;
-
-    std::vector<torch::optim::OptimizerParamGroup> param_groups;
-
-    param_groups.emplace_back(std::vector<torch::Tensor>{params.pws},
-                              std::make_unique<torch::optim::AdamOptions>(adams.pws_lr));
-    param_groups.emplace_back(std::vector<torch::Tensor>{params.low_shs},
-                              std::make_unique<torch::optim::AdamOptions>(adams.low_shs_lr));
-    param_groups.emplace_back(std::vector<torch::Tensor>{params.high_shs},
-                              std::make_unique<torch::optim::AdamOptions>(adams.high_shs_lr));
-    param_groups.emplace_back(std::vector<torch::Tensor>{params.alphas_raw},
-                              std::make_unique<torch::optim::AdamOptions>(adams.alphas_raw_lr));
-    param_groups.emplace_back(std::vector<torch::Tensor>{params.scales_raw},
-                              std::make_unique<torch::optim::AdamOptions>(adams.scales_raw_lr));
-    param_groups.emplace_back(std::vector<torch::Tensor>{params.rots_raw},
-                              std::make_unique<torch::optim::AdamOptions>(adams.rots_raw_lr));
-
-    torch::optim::Adam optimizer(param_groups, torch::optim::AdamOptions(/*lr=*/0.F));
+    std::vector<torch::optim::OptimizerParamGroup> param_groups{createAdamParamGroup(params)};
+    torch::optim::Adam                             optimizer(param_groups);
 
     // initialize the index map
     // Find the max camera height and width, so that we have enough indices for all cameras
@@ -132,6 +120,8 @@ int main(int argc, char **argv)
             max_width = cam.width;
     }
     gsplat::GLOBAL_IDX_MAP = makeIdxMap(max_height, max_width, data.device_);
+
+    GradAccumInfo grad_accum_info;
 
     constexpr int64_t kNumEpochs      = 100;
     constexpr size_t  kImageIdxToShow = 0U;
@@ -148,18 +138,26 @@ int main(int argc, char **argv)
             torch::Tensor   gt_image_tensor = data.images_[img_idx];
 
             torch::Tensor image;
-            step(params, cam, optimizer, image, gt_image_tensor);
+            step(params, cam, optimizer, grad_accum_info, image, gt_image_tensor);
 
             if (img_idx == kImageIdxToShow)
             {
                 // Show the image by copying it to CPU and converting to uint8_t
-                auto image_cpu = image.detach().cpu().permute({1, 2, 0}).clamp(0, 1).mul(255).to(torch::kUInt8);
-                std::cout << "rendered image on cpu: " << image_cpu.sizes() << "\n";
+                auto    image_cpu = image.detach().cpu().permute({1, 2, 0}).clamp(0, 1).mul(255).to(torch::kUInt8);
                 cv::Mat img_mat(image_cpu.size(0), image_cpu.size(1), CV_8UC3, image_cpu.data_ptr());
                 cv::cvtColor(img_mat, img_mat, cv::COLOR_RGB2BGR);
-                cv::imwrite("rendered_image_epoch_" + std::to_string(epoch) + ".png", img_mat);
+                // cv::imwrite("rendered_image_epoch_" + std::to_string(epoch) + ".png", img_mat);
+                cv::imshow("Rendered Image", img_mat);
+                cv::waitKey(1);
             }
             img_ctr++;
+        }
+
+        if (epoch % 10 == 0)
+        {
+            adaptiveDensification(params, optimizer, grad_accum_info, data.scene_scale_);
+            // Reset the grad accumulation info
+            grad_accum_info.reset();
         }
     }
 

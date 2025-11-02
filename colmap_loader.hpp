@@ -204,7 +204,7 @@ std::vector<Image> loadImages(const std::string &path)
         im.t[2]      = read_d(f);
         im.camera_id = read_i32(f);
         im.name      = read_string(f);
-        std::cout << "img name: " << im.name << "\n";
+        // std::cout << "img name: " << im.name << "\n";
         int64_t M = read_i64(f); // num 2D points
         for (int64_t j = 0; j < M; ++j)
         { // skip them

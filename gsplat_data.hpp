@@ -1,8 +1,10 @@
 #include "colmap_loader.hpp"
 #include "spherical_harmonics_coefs.h"
 #include "typedefs.h"
+#include <algorithm>
 #include <cstdint>
 #include <opencv2/opencv.hpp>
+#include <random>
 #include <string>
 #include <torch/torch.h>
 
@@ -56,6 +58,24 @@ loadImageTensor(const std::string &im_path, torch::Device device, const int64_t 
     // convert to C×H×W float on device, normalized [0,1]
     tensor = tensor.permute({2, 0, 1}).to(device, torch::kFloat32).div(255.0);
     return tensor;
+}
+
+// Estimate the scene scale based on the furthest camera distance from the scene center
+float findSceneScale(const std::vector<gsplat::Camera> &cameras)
+{
+    std::vector<torch::Tensor> twc_list;
+    twc_list.reserve(cameras.size());
+    for (auto const &cam : cameras)
+    {
+        twc_list.push_back(cam.twc.clone());
+    }
+    auto const twcs = torch::stack(twc_list, 0); // [num_cams, 3]
+    const auto cam_dist =
+        torch::linalg_norm(twcs - torch::mean(twcs, 0), /*ord*/ 2, /*dim=*/c10::IntArrayRef{1}); // [num_cams]
+    constexpr float kScaleFactor = 1.1F;
+    const float     scene_scale  = torch::max(cam_dist).item<float>() * kScaleFactor;
+    std::cout << "scene scale: " << scene_scale << std::endl;
+    return scene_scale;
 }
 
 } // namespace
@@ -147,8 +167,8 @@ class GsplatData
             const float w_scale    = actual_img.cols / static_cast<float>(cams[im.camera_id].w);
             const float h_scale    = actual_img.rows / static_cast<float>(cams[im.camera_id].h);
 
-            std::cout << "image size: " << actual_img.cols << " x " << actual_img.rows << ", w_scale: " << w_scale
-                      << ", h_scale: " << h_scale << std::endl;
+            // std::cout << "image size: " << actual_img.cols << " x " << actual_img.rows << ", w_scale: " << w_scale
+            //           << ", h_scale: " << h_scale << std::endl;
 
             Camera cam;
             cam.id     = im.id;
@@ -174,6 +194,18 @@ class GsplatData
 
         // TODO: (Remove) Limit the data
         {
+            std::random_device rd;
+            std::mt19937       gen(rd());
+
+            std::shuffle(gaussians_.pws.begin(), gaussians_.pws.end(), gen);
+            std::shuffle(gaussians_.shs.begin(), gaussians_.shs.end(), gen);
+            std::shuffle(gaussians_.scales.begin(), gaussians_.scales.end(), gen);
+            std::shuffle(gaussians_.rots.begin(), gaussians_.rots.end(), gen);
+            std::shuffle(gaussians_.alphas.begin(), gaussians_.alphas.end(), gen);
+
+            // std::shuffle(images_.begin(), images_.end(), gen);
+            // std::shuffle(cameras_.begin(), cameras_.end(), gen);
+
             gaussians_.pws.resize(10000);
             gaussians_.shs.resize(10000);
             gaussians_.scales.resize(10000);
@@ -182,11 +214,15 @@ class GsplatData
             images_.resize(10);
             cameras_.resize(10);
         }
+
+        scene_scale_ = findSceneScale(cameras_);
     }
 
   public:
     std::vector<Camera>        cameras_;
     std::vector<torch::Tensor> images_;
     Gaussians                  gaussians_;
+
+    float scene_scale_{0.F};
 };
 } // namespace gsplat

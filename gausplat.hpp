@@ -2,6 +2,7 @@
 #include "spherical_harmonics_coefs.h"
 #include "typedefs.h"
 #include "utils.hpp"
+#include <execution>
 #include <torch/torch.h>
 
 namespace
@@ -285,7 +286,83 @@ torch::Tensor splatTiled(const Camera  &cam,
                 gaussians_in_tiles[ty * n_tiles_x + tx].push_back(static_cast<int32_t>(i));
     }
 
-    // --- Process each tile
+    // Main splatting logic per each tile
+    // x0t, x1t, y0t, y1t: tile bounds in pixel coordinates | tx, ty: tile indices
+    auto splat_tile = [&](const int x0t, const int x1t, const int y0t, const int y1t, const int tx, const int ty)
+    {
+        const int num_pixels_in_tile = (y1t - y0t) * (x1t - x0t);
+        const int tile_height        = y1t - y0t;
+        const int tile_width         = x1t - x0t;
+
+        auto &gaus_ids_in_this_tile_vec = gaussians_in_tiles[ty * n_tiles_x + tx];
+        if (gaus_ids_in_this_tile_vec.empty())
+            return;
+
+        // Convert indices to Tensor
+        torch::Tensor gaus_ids_in_this_tile = torch::from_blob(gaus_ids_in_this_tile_vec.data(),
+                                                               {static_cast<int64_t>(gaus_ids_in_this_tile_vec.size())},
+                                                               torch::TensorOptions().dtype(torch::kInt32))
+                                                  .to(device)
+                                                  .to(torch::kLong)
+                                                  .clone();
+
+        // Gather Gaussian attributes (NOTE: index_select copies data)
+        torch::Tensor means2D               = gaussian_2d_centers.index_select(0, gaus_ids_in_this_tile);
+        torch::Tensor cinv                  = cov2d_inv.index_select(0, gaus_ids_in_this_tile);
+        torch::Tensor opacity               = alphas.index_select(0, gaus_ids_in_this_tile);
+        torch::Tensor colors_tile           = colors.index_select(0, gaus_ids_in_this_tile);
+        const int64_t num_gaussians_in_tile = gaus_ids_in_this_tile.size(0);
+
+        // Pixel grid for this tile
+        // [2, tile_height, tile_width]
+        auto sub_region = GLOBAL_IDX_MAP.index({Slice(), Slice(y0t, y1t), Slice(x0t, x1t)});
+        // Reshape to [num_pixels_in_tile, 2]
+        torch::Tensor tile_xy = sub_region.permute({1, 2, 0}).reshape({num_pixels_in_tile, 2}).to(dtype);
+
+        // Gaussian's weight per pixel: Difference between the tile coordinates and the gaussian centers
+        // [num_pixels_in_tile, num_gaussians_in_tile] = [num_pixels_in_tile, 1] - [1, num_gaussians_in_tile]
+        torch::Tensor dx = tile_xy.index({Slice(), 0}).unsqueeze(1) - means2D.index({Slice(), 0}).unsqueeze(0);
+        torch::Tensor dy = tile_xy.index({Slice(), 1}).unsqueeze(1) - means2D.index({Slice(), 1}).unsqueeze(0);
+
+        torch::Tensor c00 = cinv.index({Slice(), 0}).unsqueeze(0);
+        torch::Tensor c01 = cinv.index({Slice(), 1}).unsqueeze(0);
+        torch::Tensor c11 = cinv.index({Slice(), 2}).unsqueeze(0);
+
+        // The Gaussian density for a pixel at offset x=(dx,dy) is:
+        // w = exp(-0.5 * x^t * Cinv * x)
+        // x^t * Cinv * x = dx^2 * c00 + dy^2 * c11 + 2*dx*dy*c01
+        // [num_pixels_in_tile, num_gaussians_in_tile]
+        torch::Tensor quad = dx.mul(dx).mul(c00) + dy.mul(dy).mul(c11) + dx.mul(dy).mul(2.0).mul(c01);
+
+        // α = exp(-0.5*quad) * opacity
+        torch::Tensor opacity_view      = opacity.view({1, num_gaussians_in_tile});
+        torch::Tensor opacity_broadcast = opacity_view.expand({num_pixels_in_tile, num_gaussians_in_tile});
+        // [num_pixels_in_tile, num_gaussians_in_tile]
+        torch::Tensor alpha = torch::exp(-0.5 * quad).mul(opacity_broadcast).clamp_max(0.99);
+
+        // Calculate exclusive transmittence: Each gaussian's color contribution is weighted by
+        // transmittence of all the layers in front of it, but not itself
+        // T_j = prod_{k<j} (1 - α_k)
+
+        // T_before_roll = [[t0, t1, t2, t3]]
+        // T_after_roll = [[t3, t0, t1, t2]]
+        // T_final = [[1, t0, t1, t2]]
+        torch::Tensor one_minus = 1.0 - alpha;                  // [num_pixels_in_tile, num_gaussians_in_tile]
+        torch::Tensor T         = torch::cumprod(one_minus, 1); // inclusive transmittence
+        T                       = torch::roll(T, /*shifts=*/{1}, /*dims=*/{1}); // circular shift right by 1
+        T.index_put_({Slice(), 0}, 1.0);                                        // fix first col to 1 for exclusivity
+        // T = [num_pixels_in_tile, num_gaussians_in_tile]
+
+        // Color accumulation
+        torch::Tensor weights  = T * alpha;                           // [num_pixels_in_tile, num_gaussians_in_tile]
+        torch::Tensor tile_col = torch::matmul(weights, colors_tile); // [num_pixels_in_tile,3]
+
+        // Write back
+        image.index_put_({Slice(y0t, y1t), Slice(x0t, x1t), Slice()}, tile_col.view({tile_height, tile_width, 3}));
+    };
+
+    // ----- SERIAL VERSION -----
+    // Run splatting for each tile
     for (int ty = 0; ty < n_tiles_y; ++ty)
     {
         const int y0t = ty * TH;
@@ -296,83 +373,40 @@ torch::Tensor splatTiled(const Camera  &cam,
             const int x0t = tx * TW;
             const int x1t = std::min(static_cast<int>(cam.width), x0t + TW);
 
-            const int num_pixels_in_tile = (y1t - y0t) * (x1t - x0t);
-            const int tile_height        = y1t - y0t;
-            const int tile_width         = x1t - x0t;
-
-            auto &gaus_ids_in_this_tile_vec = gaussians_in_tiles[ty * n_tiles_x + tx];
-            if (gaus_ids_in_this_tile_vec.empty())
-                continue;
-
-            // Convert indices to Tensor
-            torch::Tensor gaus_ids_in_this_tile =
-                torch::from_blob(gaus_ids_in_this_tile_vec.data(),
-                                 {static_cast<int64_t>(gaus_ids_in_this_tile_vec.size())},
-                                 torch::TensorOptions().dtype(torch::kInt32))
-                    .to(device)
-                    .to(torch::kLong)
-                    .clone();
-
-            // Gather Gaussian attributes (NOTE: index_select copies data)
-            torch::Tensor means2D               = gaussian_2d_centers.index_select(0, gaus_ids_in_this_tile);
-            torch::Tensor cinv                  = cov2d_inv.index_select(0, gaus_ids_in_this_tile);
-            torch::Tensor opacity               = alphas.index_select(0, gaus_ids_in_this_tile);
-            torch::Tensor colors_tile           = colors.index_select(0, gaus_ids_in_this_tile);
-            const int64_t num_gaussians_in_tile = gaus_ids_in_this_tile.size(0);
-
-            // Pixel grid for this tile
-            // [2, tile_height, tile_width]
-            auto sub_region = GLOBAL_IDX_MAP.index({Slice(), Slice(y0t, y1t), Slice(x0t, x1t)});
-            // Reshape to [num_pixels_in_tile, 2]
-            torch::Tensor tile_xy = sub_region.permute({1, 2, 0}).reshape({num_pixels_in_tile, 2}).to(dtype);
-
-            // Gaussian's weight per pixel: Difference between the tile coordinates and the gaussian centers
-            // [num_pixels_in_tile, num_gaussians_in_tile] = [num_pixels_in_tile, 1] - [1, num_gaussians_in_tile]
-            torch::Tensor dx = tile_xy.index({Slice(), 0}).unsqueeze(1) - means2D.index({Slice(), 0}).unsqueeze(0);
-            torch::Tensor dy = tile_xy.index({Slice(), 1}).unsqueeze(1) - means2D.index({Slice(), 1}).unsqueeze(0);
-
-            torch::Tensor c00 = cinv.index({Slice(), 0}).unsqueeze(0);
-            torch::Tensor c01 = cinv.index({Slice(), 1}).unsqueeze(0);
-            torch::Tensor c11 = cinv.index({Slice(), 2}).unsqueeze(0);
-
-            // The Gaussian density for a pixel at offset x=(dx,dy) is:
-            // w = exp(-0.5 * x^t * Cinv * x)
-            // x^t * Cinv * x = dx^2 * c00 + dy^2 * c11 + 2*dx*dy*c01
-            // [num_pixels_in_tile, num_gaussians_in_tile]
-            torch::Tensor quad = dx.mul(dx).mul(c00) + dy.mul(dy).mul(c11) + dx.mul(dy).mul(2.0).mul(c01);
-
-            // α = exp(-0.5*quad) * opacity
-            torch::Tensor opacity_view      = opacity.view({1, num_gaussians_in_tile});
-            torch::Tensor opacity_broadcast = opacity_view.expand({num_pixels_in_tile, num_gaussians_in_tile});
-            // [num_pixels_in_tile, num_gaussians_in_tile]
-            torch::Tensor alpha = torch::exp(-0.5 * quad).mul(opacity_broadcast).clamp_max(0.99);
-
-            // Calculate exclusive transmittence: Each gaussian's color contribution is weighted by
-            // transmittence of all the layers in front of it, but not itself
-            // T_j = prod_{k<j} (1 - α_k)
-
-            // T_before_roll = [[t0, t1, t2, t3]]
-            // T_after_roll = [[t3, t0, t1, t2]]
-            // T_final = [[1, t0, t1, t2]]
-            torch::Tensor one_minus = 1.0 - alpha;                  // [num_pixels_in_tile, num_gaussians_in_tile]
-            torch::Tensor T         = torch::cumprod(one_minus, 1); // inclusive transmittence
-            T                       = torch::roll(T, /*shifts=*/{1}, /*dims=*/{1}); // circular shift right by 1
-            T.index_put_({Slice(), 0}, 1.0); // fix first col to 1 for exclusivity
-            // T = [num_pixels_in_tile, num_gaussians_in_tile]
-
-            // Color accumulation
-            torch::Tensor weights  = T * alpha;                           // [num_pixels_in_tile, num_gaussians_in_tile]
-            torch::Tensor tile_col = torch::matmul(weights, colors_tile); // [num_pixels_in_tile,3]
-
-            // Write back
-            image.index_put_({Slice(y0t, y1t), Slice(x0t, x1t), Slice()}, tile_col.view({tile_height, tile_width, 3}));
+            splat_tile(x0t, x1t, y0t, y1t, tx, ty);
         }
     }
+
+    // ----- PARALLEL VERSION ----- (slower due to thread launch overhead)
+    // std::vector<std::pair<int, int>> tiles;
+    // tiles.reserve(n_tiles_x * n_tiles_y);
+    // for (int ty = 0; ty < n_tiles_y; ++ty)
+    //     for (int tx = 0; tx < n_tiles_x; ++tx)
+    //         tiles.emplace_back(tx, ty);
+
+    // std::for_each(std::execution::par,
+    //               tiles.begin(),
+    //               tiles.end(),
+    //               [&](auto const tile)
+    //               {
+    //                   const int tx = tile.first;
+    //                   const int ty = tile.second;
+
+    //                   const int y0t = ty * TH;
+    //                   const int y1t = std::min(static_cast<int>(cam.height), y0t + TH);
+    //                   const int x0t = tx * TW;
+    //                   const int x1t = std::min(static_cast<int>(cam.width), x0t + TW);
+
+    //                   splat_tile(x0t, x1t, y0t, y1t, tx, ty);
+    //               });
 
     return image;
 }
 
-torch::Tensor forwardWithCulling(LearnableParams &params, const Camera &cam)
+torch::Tensor forwardWithCulling(LearnableParams &params,
+                                 const Camera    &cam,
+                                 torch::Tensor   &depths_in_cam_frame_out,
+                                 torch::Tensor   &gaus_centers_img_frame_out)
 {
     auto alphas = getAlphas(params.alphas_raw);
     auto scales = getScales(params.scales_raw);
@@ -380,17 +414,19 @@ torch::Tensor forwardWithCulling(LearnableParams &params, const Camera &cam)
     auto shs    = getShs(params.low_shs, params.high_shs);
 
     // 1) Project 3D gaussian centers to camera coordinates and image coordinates
-    torch::Tensor gaus_centers_img_frame;
-    auto          gaus_centers_cam_frame = project(params.pws, cam, gaus_centers_img_frame);
+    auto gaus_centers_cam_frame = project(params.pws, cam, gaus_centers_img_frame_out);
+    // Normally not part of the computational graph, however needed for gradient accumulation
+    // in image space, which is later used in adaptive densification
+    gaus_centers_img_frame_out.retain_grad();
 
     // 2) Build frustum mask and filter out gaussians outside the frustum
-    auto z = gaus_centers_cam_frame.index({Slice(), 2}); // [N]
+    const auto z = gaus_centers_cam_frame.index({Slice(), 2}); // [N]
     // Calculate normalized device coordinates of the gaussian centers in the image frame
-    auto u_ndc    = gaus_centers_img_frame.index({Slice(), 0}) / cam.width * 2.F - 1.F;  // map to [-1, 1]
-    auto v_ndc    = gaus_centers_img_frame.index({Slice(), 1}) / cam.height * 2.F - 1.F; // map to [-1, 1]
-    auto radii_3d = std::get<0>(scales.max(1, false)) * 3.0f;   // 3 sigma based on gaussian covariance
-    auto r_x_ndc  = radii_3d * (cam.fx / z) / cam.width * 2.0f; // radius in normalized image coordinates
-    auto r_y_ndc  = radii_3d * (cam.fy / z) / cam.height * 2.0f;
+    const auto u_ndc    = gaus_centers_img_frame_out.index({Slice(), 0}) / cam.width * 2.F - 1.F;  // map to [-1, 1]
+    const auto v_ndc    = gaus_centers_img_frame_out.index({Slice(), 1}) / cam.height * 2.F - 1.F; // map to [-1, 1]
+    const auto radii_3d = std::get<0>(scales.max(1, false)) * 3.0f;   // 3 sigma based on gaussian covariance
+    const auto r_x_ndc  = radii_3d * (cam.fx / z) / cam.width * 2.0f; // radius in normalized image coordinates
+    const auto r_y_ndc  = radii_3d * (cam.fy / z) / cam.height * 2.0f;
     // Check if within the camera frustum (6 sides)
     constexpr float kNearClip = 0.2F;
     constexpr float kFarClip  = 100.0F;
@@ -401,12 +437,12 @@ torch::Tensor forwardWithCulling(LearnableParams &params, const Camera &cam)
               << std::endl;
 
     // Pick the parameters of the surviving Gaussians (causes copy)
-    auto pws_culled                    = params.pws.index({culled_gaus_ids});             // [M,3]
-    auto alphas_culled                 = alphas.index({culled_gaus_ids});                 // [M]
-    auto scales_culled                 = scales.index({culled_gaus_ids});                 // [M,3]
-    auto rots_culled                   = rots.index({culled_gaus_ids});                   // [M,3,3]
-    auto gaus_centers_img_frame_culled = gaus_centers_img_frame.index({culled_gaus_ids}); // [M,2]
-    auto shs_culled                    = shs.index({culled_gaus_ids});                    // [M, sh_dim]
+    auto pws_culled                    = params.pws.index({culled_gaus_ids});                 // [M,3]
+    auto alphas_culled                 = alphas.index({culled_gaus_ids});                     // [M]
+    auto scales_culled                 = scales.index({culled_gaus_ids});                     // [M,3]
+    auto rots_culled                   = rots.index({culled_gaus_ids});                       // [M,3,3]
+    auto gaus_centers_img_frame_culled = gaus_centers_img_frame_out.index({culled_gaus_ids}); // [M,2]
+    auto shs_culled                    = shs.index({culled_gaus_ids});                        // [M, sh_dim]
 
     // 3) Compute 3D covariance matrices for each gaussian
     auto cov3d_culled = computeCov3d(scales_culled, rots_culled);
@@ -423,6 +459,7 @@ torch::Tensor forwardWithCulling(LearnableParams &params, const Camera &cam)
     auto image = splatTiled(
         cam, gaus_centers_img_frame_culled, cinv_culled, alphas_culled, depths_culled, colors_culled, areas_culled);
 
+    depths_in_cam_frame_out = z;
     return image;
 }
 

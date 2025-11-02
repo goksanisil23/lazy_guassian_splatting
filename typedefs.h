@@ -53,3 +53,15 @@ struct AdamsParams
     const float scales_raw_lr = 0.005f;
     const float rots_raw_lr   = 0.001f;
 };
+
+struct GradAccumInfo
+{
+    torch::Tensor accum_grads; // [N,1]
+    torch::Tensor count;       // [N]
+
+    void reset()
+    {
+        accum_grads.reset();
+        count.reset();
+    }
+};

@@ -51,3 +51,25 @@ torch::Tensor makeIdxMap(int H, int W, const torch::Device &device)
     // stack {x‐grid, y‐grid} to get [2,H,W] with [0,:,:]=x, [1,:,:]=y
     return torch::stack({grids[1], grids[0]}, /*dim=*/0);
 }
+
+std::vector<torch::optim::OptimizerParamGroup> createAdamParamGroup(const LearnableParams &params)
+{
+    const AdamsParams adams_params;
+
+    std::vector<torch::optim::OptimizerParamGroup> param_groups;
+
+    param_groups.emplace_back(std::vector<torch::Tensor>{params.pws},
+                              std::make_unique<torch::optim::AdamOptions>(adams_params.pws_lr));
+    param_groups.emplace_back(std::vector<torch::Tensor>{params.low_shs},
+                              std::make_unique<torch::optim::AdamOptions>(adams_params.low_shs_lr));
+    param_groups.emplace_back(std::vector<torch::Tensor>{params.high_shs},
+                              std::make_unique<torch::optim::AdamOptions>(adams_params.high_shs_lr));
+    param_groups.emplace_back(std::vector<torch::Tensor>{params.alphas_raw},
+                              std::make_unique<torch::optim::AdamOptions>(adams_params.alphas_raw_lr));
+    param_groups.emplace_back(std::vector<torch::Tensor>{params.scales_raw},
+                              std::make_unique<torch::optim::AdamOptions>(adams_params.scales_raw_lr));
+    param_groups.emplace_back(std::vector<torch::Tensor>{params.rots_raw},
+                              std::make_unique<torch::optim::AdamOptions>(adams_params.rots_raw_lr));
+
+    return param_groups;
+}

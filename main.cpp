@@ -18,7 +18,7 @@ namespace
 constexpr bool    kEnableAdaptiveDensification = true;
 constexpr int64_t kNumGaussiansToLoad          = 10000;
 constexpr int64_t kNumGaussiansLimit           = 25000; // set based on available GPU memory
-constexpr int64_t kNumEpochs                   = 300;
+constexpr int64_t kNumEpochs                   = 500;
 constexpr size_t  kImageIdxToShow              = 0U;
 
 std::vector<size_t> generateShuffledIndices(const size_t N)

@@ -5,8 +5,8 @@
 
 cv::Mat plotLosses(const std::vector<float> &losses)
 {
-    constexpr int kWidth  = 800;
-    constexpr int kHeight = 400;
+    constexpr int kWidth  = 1200;
+    constexpr int kHeight = 800;
 
     cv::Mat plot(kHeight, kWidth, CV_8UC3, cv::Scalar(30, 30, 30));
 
@@ -31,7 +31,7 @@ cv::Mat plotLosses(const std::vector<float> &losses)
     for (int i = 0; i < n; ++i)
     {
         const cv::Point p = xy(i);
-        cv::circle(plot, p, 3, cv::Scalar(0, 200, 255), cv::FILLED, cv::LINE_AA);
+        cv::circle(plot, p, 2, cv::Scalar(0, 200, 255), cv::FILLED, cv::LINE_AA);
 
         // Label every Nth point (to avoid clutter)
         if ((i == n - 1) || (i % 10 == 0))

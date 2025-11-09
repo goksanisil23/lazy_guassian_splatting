@@ -29,7 +29,7 @@ struct Gaussians
     std::vector<Vec3d> pws;    // world coordinates of the Gaussian centers
     std::vector<Vec3d> shs;    // spherical harmonics coefficients
     std::vector<Vec3d> scales; // scales
-    std::vector<Vec4d> rots;   // RGB colors of the Gaussians
+    std::vector<Vec4d> rots;   // rotations (quaternions)
     std::vector<float> alphas; // alpha values for transparency
 };
 } // namespace gsplat

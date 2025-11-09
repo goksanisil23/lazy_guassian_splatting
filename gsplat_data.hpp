@@ -151,7 +151,7 @@ class GsplatData
   public:
     const torch::Device device_{torch::kCUDA};
 
-    GsplatData(const std::string &dataset_path)
+    GsplatData(const std::string &dataset_path, const int64_t max_num_gaussians)
     {
         auto cams = colmap_loader::loadCameras(dataset_path + "/sparse/0/cameras.bin");
         auto ims  = colmap_loader::loadImages(dataset_path + "/sparse/0/images.bin");
@@ -166,9 +166,6 @@ class GsplatData
             auto const  actual_img = loadSingleImage(dataset_path + "/images/" + im.name);
             const float w_scale    = actual_img.cols / static_cast<float>(cams[im.camera_id].w);
             const float h_scale    = actual_img.rows / static_cast<float>(cams[im.camera_id].h);
-
-            // std::cout << "image size: " << actual_img.cols << " x " << actual_img.rows << ", w_scale: " << w_scale
-            //           << ", h_scale: " << h_scale << std::endl;
 
             Camera cam;
             cam.id     = im.id;
@@ -205,12 +202,14 @@ class GsplatData
 
             // std::shuffle(images_.begin(), images_.end(), gen);
             // std::shuffle(cameras_.begin(), cameras_.end(), gen);
+            std::reverse(images_.begin(), images_.end());
+            std::reverse(cameras_.begin(), cameras_.end());
 
-            gaussians_.pws.resize(10000);
-            gaussians_.shs.resize(10000);
-            gaussians_.scales.resize(10000);
-            gaussians_.rots.resize(10000);
-            gaussians_.alphas.resize(10000);
+            gaussians_.pws.resize(max_num_gaussians);
+            gaussians_.shs.resize(max_num_gaussians);
+            gaussians_.scales.resize(max_num_gaussians);
+            gaussians_.rots.resize(max_num_gaussians);
+            gaussians_.alphas.resize(max_num_gaussians);
             images_.resize(10);
             cameras_.resize(10);
         }

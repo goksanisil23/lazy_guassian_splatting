@@ -8,8 +8,7 @@ namespace
     https://github.com/Po-Hsun-Su/pytorch-ssim/blob/master/pytorch_ssim/__init__.py
 */
 
-// Create a 1D Gaussian kernel of length `window_size` and standard
-// deviation `sigma`. Returned tensor is float32 on CPU.
+// Create a 1D Gaussian kernel of length `window_size` and standard deviation `sigma`
 torch::Tensor gaussian(const int window_size, const double sigma)
 {
     auto      gauss  = torch::empty({window_size}, torch::kFloat32);
@@ -20,8 +19,7 @@ torch::Tensor gaussian(const int window_size, const double sigma)
             std::exp(-static_cast<float>((i - center) * (i - center)) / static_cast<float>(2.0 * sigma * sigma));
         gauss[i] = val;
     }
-    gauss = gauss / gauss.sum();
-    return gauss; // shape [window_size], CPU float32
+    return gauss / gauss.sum();
 }
 
 // Build a 2D separable window of size [channel, 1, window_size, window_size].
@@ -41,7 +39,7 @@ torch::Tensor createWindow(const int window_size, const int64_t channel)
                                    .expand({channel, 1, window_size, window_size})
                                    .contiguous(); // [C,1,W,W]
 
-    return _2D_window; // CPU float32
+    return _2D_window;
 }
 
 // Internal SSIM computation. Expects:
@@ -67,26 +65,26 @@ torch::Tensor _ssim(const torch::Tensor &img1,
     conv_opts.padding(window_size / 2).groups(channel);
 
     // μ1 = conv2d(img1, window)
-    torch::Tensor mu1 = F::conv2d(img1, window, conv_opts);
-    torch::Tensor mu2 = F::conv2d(img2, window, conv_opts);
+    torch::Tensor const mu1 = F::conv2d(img1, window, conv_opts);
+    torch::Tensor const mu2 = F::conv2d(img2, window, conv_opts);
 
-    torch::Tensor mu1_sq  = mu1.pow(2);
-    torch::Tensor mu2_sq  = mu2.pow(2);
-    torch::Tensor mu1_mu2 = mu1 * mu2;
+    torch::Tensor const mu1_sq  = mu1.pow(2);
+    torch::Tensor const mu2_sq  = mu2.pow(2);
+    torch::Tensor const mu1_mu2 = mu1 * mu2;
 
     // σ1² = conv2d(img1*img1, window) - μ1²
-    torch::Tensor sigma1_sq = F::conv2d(img1 * img1, window, conv_opts) - mu1_sq;
-    torch::Tensor sigma2_sq = F::conv2d(img2 * img2, window, conv_opts) - mu2_sq;
-    torch::Tensor sigma12   = F::conv2d(img1 * img2, window, conv_opts) - mu1_mu2;
+    torch::Tensor const sigma1_sq = F::conv2d(img1 * img1, window, conv_opts) - mu1_sq;
+    torch::Tensor const sigma2_sq = F::conv2d(img2 * img2, window, conv_opts) - mu2_sq;
+    torch::Tensor const sigma12   = F::conv2d(img1 * img2, window, conv_opts) - mu1_mu2;
 
     // Constants per original SSIM paper
-    constexpr double C1 = 0.01 * 0.01; // 0.0001
-    constexpr double C2 = 0.03 * 0.03; // 0.0009
+    constexpr double C1{0.01 * 0.01}; // 0.0001
+    constexpr double C2{0.03 * 0.03}; // 0.0009
 
     // SSIM map: ((2 μ1μ2 + C1)*(2 σ12 + C2)) / ((μ1² + μ2² + C1)*(σ1² + σ2² + C2))
-    torch::Tensor numerator   = (2 * mu1_mu2 + C1) * (2 * sigma12 + C2);
-    torch::Tensor denominator = (mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2);
-    torch::Tensor ssim_map    = numerator / denominator; // [N, C, H, W]
+    const torch::Tensor numerator   = (2 * mu1_mu2 + C1) * (2 * sigma12 + C2);
+    const torch::Tensor denominator = (mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2);
+    const torch::Tensor ssim_map    = numerator / denominator; // [N, C, H, W]
 
     if (size_average)
     {
@@ -107,7 +105,7 @@ torch::Tensor _ssim(const torch::Tensor &img1,
 torch::Tensor
 ssim(const torch::Tensor &img1, const torch::Tensor &img2, const int window_size = 11, const bool size_average = true)
 {
-    int64_t channel = img1.size(0); // C dimension
+    int64_t const channel = img1.size(0); // C dimension
 
     // Create CPU float32 window [C,1,window_size,window_size]
     torch::Tensor window = createWindow(window_size, channel);
@@ -125,10 +123,10 @@ torch::Tensor gaussianLoss(const torch::Tensor &image, const torch::Tensor &gt_i
     constexpr float kLossLambda = 0.2f;
 
     // L1 loss: mean absolute difference
-    torch::Tensor loss_l1 = torch::abs(image - gt_image).mean();
+    torch::Tensor const loss_l1 = torch::abs(image - gt_image).mean();
 
     // SSIM loss: 1 - SSIM(image, gt_image)
-    torch::Tensor loss_ssim = 1.0f - ssim(image, gt_image);
+    torch::Tensor const loss_ssim = 1.0f - ssim(image, gt_image);
 
     // Combine losses
     return (1.0f - kLossLambda) * loss_l1 + kLossLambda * loss_ssim;

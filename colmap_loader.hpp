@@ -12,23 +12,23 @@ namespace colmap_loader
 
 struct Camera
 {
-    int32_t             id, model_id;
-    uint64_t            w, h;
-    std::vector<double> params;
+    int32_t            id, model_id;
+    uint64_t           w, h;
+    std::vector<float> params;
 };
 
 struct Image
 {
-    int32_t               id, camera_id;
-    std::array<double, 4> q; // quaternion (w, x, y, z)
-    std::array<double, 3> t; // translation (tx, ty, tz)
-    std::string           name;
+    int32_t              id, camera_id;
+    std::array<float, 4> q; // quaternion (w, x, y, z)
+    std::array<float, 3> t; // translation (tx, ty, tz)
+    std::string          name;
 };
 
 struct Point3D
 {
     int64_t id;
-    double  x, y, z;
+    float   x, y, z;
     uint8_t r, g, b;
 };
 
@@ -177,7 +177,7 @@ std::unordered_map<uint32_t, Camera> loadCameras(const std::string &path)
         int np     = numParams(c.model_id);
         c.params.resize(np);
         for (int j = 0; j < np; ++j)
-            c.params[j] = read_d(f);
+            c.params[j] = static_cast<float>(read_d(f));
         cams[c.id] = c;
     }
     return cams;
@@ -195,13 +195,13 @@ std::vector<Image> loadImages(const std::string &path)
     {
         Image im;
         im.id        = read_i32(f);
-        im.q[0]      = read_d(f); // w
-        im.q[1]      = read_d(f); // x
-        im.q[2]      = read_d(f); // y
-        im.q[3]      = read_d(f); // z
-        im.t[0]      = read_d(f);
-        im.t[1]      = read_d(f);
-        im.t[2]      = read_d(f);
+        im.q[0]      = static_cast<float>(read_d(f)); // w
+        im.q[1]      = static_cast<float>(read_d(f)); // x
+        im.q[2]      = static_cast<float>(read_d(f)); // y
+        im.q[3]      = static_cast<float>(read_d(f)); // z
+        im.t[0]      = static_cast<float>(read_d(f));
+        im.t[1]      = static_cast<float>(read_d(f));
+        im.t[2]      = static_cast<float>(read_d(f));
         im.camera_id = read_i32(f);
         im.name      = read_string(f);
         // std::cout << "img name: " << im.name << "\n";
@@ -229,9 +229,9 @@ std::vector<Point3D> loadPoints(const std::string &path)
     {
         Point3D p;
         p.id = read_i64(f);
-        p.x  = read_d(f);
-        p.y  = read_d(f);
-        p.z  = read_d(f);
+        p.x  = static_cast<float>(read_d(f));
+        p.y  = static_cast<float>(read_d(f));
+        p.z  = static_cast<float>(read_d(f));
         p.r  = read_u8(f);
         p.g  = read_u8(f);
         p.b  = read_u8(f);

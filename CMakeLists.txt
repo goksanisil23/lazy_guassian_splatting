@@ -25,3 +25,27 @@ target_include_directories(gsplat PUBLIC
 )
 
 target_compile_options(gsplat PUBLIC ${COMPILER_FLAGS})
+
+# Rendering
+set(RAYLIB_CPP_INCLUDE_DIR "/home/s0001734/Downloads/raylib-cpp/include")
+set(RAYLIB_INCLUDE_DIR "/home/s0001734/Downloads/raylib-cpp/build/_deps/raylib-build/raylib/include")
+set(RAYLIB_LINK_DIR "/home/s0001734/Downloads/raylib-cpp/build/_deps/raylib-build/raylib")
+
+add_executable(render render.cpp)
+
+target_include_directories(render SYSTEM PRIVATE
+    ${OpenCV_INCLUDE_DIRS}
+)
+
+target_link_directories(render PRIVATE ${RAYLIB_LINK_DIR})
+
+target_link_libraries(render ${TORCH_LIBRARIES} ${OpenCV_LIBS} pthread dl rt TBB::tbb raylib)
+
+target_include_directories(render PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${RAYLIB_CPP_INCLUDE_DIR}
+    ${RAYLIB_INCLUDE_DIR}
+
+)
+
+target_compile_options(render PUBLIC ${COMPILER_FLAGS})

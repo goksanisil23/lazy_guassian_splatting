@@ -1,12 +1,17 @@
 #include "adaptive_densification.hpp"
 #include "gausplat.hpp"
 #include "gsplat_data.hpp"
+#include "io.hpp"
+#include "params_to_gaussians.hpp"
 #include "plot_helper.hpp"
 #include "ssim.hpp"
 #include "typedefs.h"
 #include "utils.hpp"
 
+#include <ATen/cuda/CUDAContext.h>
 #include <algorithm>
+#include <c10/cuda/CUDACachingAllocator.h>
+#include <cuda_runtime.h>
 #include <fstream>
 #include <numeric>
 #include <random>
@@ -15,11 +20,12 @@
 namespace
 {
 
-constexpr bool    kEnableAdaptiveDensification = true;
-constexpr int64_t kNumGaussiansToLoad          = 10000;
-constexpr int64_t kNumGaussiansLimit           = 25000; // set based on available GPU memory
-constexpr int64_t kNumEpochs                   = 500;
-constexpr size_t  kImageIdxToShow              = 0U;
+constexpr bool     kEnableAdaptiveDensification = true;
+constexpr bool     kUseHigherShs                = false;
+constexpr uint32_t kNumGaussiansToLoad          = 10000;
+constexpr uint32_t kNumImagesToLoad             = 10;
+constexpr int64_t  kNumEpochs                   = 500; // 500
+constexpr size_t   kImageIdxToShow              = 0U;
 
 std::vector<size_t> generateShuffledIndices(const size_t N)
 {
@@ -29,50 +35,20 @@ std::vector<size_t> generateShuffledIndices(const size_t N)
     return indices;
 }
 
-} // namespace
-
-LearnableParams createLearningParamsFromGaussians(const gsplat::Gaussians &gaussians, const torch::Device &device)
+bool hasReachedGpuLimit()
 {
-    LearnableParams params;
-    // 1) pws
-    params.pws = torch::from_blob((void *)(gaussians.pws.data()),
-                                  {(long)gaussians.pws.size(), 3},
-                                  torch::TensorOptions().dtype(torch::kFloat32))
-                     .to(device)
-                     .set_requires_grad(true); // [N,3]
+    size_t free_bytes = 0, total_bytes = 0;
+    cudaMemGetInfo(&free_bytes, &total_bytes);
 
-    // 2) rots_raw
-    params.rots_raw = torch::from_blob((void *)(gaussians.rots.data()),
-                                       {(long)gaussians.rots.size(), 4},
-                                       torch::TensorOptions().dtype(torch::kFloat32))
-                          .to(device)
-                          .set_requires_grad(true); // [N,4]
+    double free_mb  = free_bytes / (1024.0 * 1024.0);
+    double total_mb = total_bytes / (1024.0 * 1024.0);
 
-    // 3) scales_raw
-    params.scales_raw = getScalesRaw(torch::from_blob((void *)(gaussians.scales.data()),
-                                                      {(long)gaussians.scales.size(), 3},
-                                                      torch::TensorOptions().dtype(torch::kFloat32))
-                                         .to(device))
-                            .set_requires_grad(true); // [N,3]
-
-    // 4) alphas_raw
-    params.alphas_raw = getAlphasRaw(torch::from_blob((void *)(gaussians.alphas.data()),
-                                                      {(long)gaussians.alphas.size(), 1},
-                                                      torch::TensorOptions().dtype(torch::kFloat32))
-                                         .to(device))
-                            .set_requires_grad(true); // [N,1]
-
-    // 5) low_shs & high_shs
-    params.low_shs = torch::from_blob((void *)(gaussians.shs.data()),
-                                      {(long)gaussians.shs.size(), 3},
-                                      torch::TensorOptions().dtype(torch::kFloat32))
-                         .to(device)
-                         .set_requires_grad(true); // [N,3]
-    params.high_shs =
-        torch::ones_like(params.low_shs).repeat({1, 15}).mul(0.001f).to(device).set_requires_grad(true); // [N,15]
-
-    return params;
+    constexpr double kSafetyMarginMb = 250.0;
+    std::cout << "Free GPU memory: " << free_mb << " MB / " << total_mb << " MB" << std::endl;
+    return free_mb < kSafetyMarginMb;
 }
+
+} // namespace
 
 float step(LearnableParams         &params,
            const gsplat::Camera    &cam,
@@ -112,11 +88,10 @@ int main(int argc, char **argv)
         std::cerr << "Usage: " << argv[0] << " <path_to_sparse_0>\n";
         return 1;
     }
-    std::string        dir                   = argv[1];
-    const int64_t      num_gaussians_to_load = kEnableAdaptiveDensification ? kNumGaussiansToLoad : kNumGaussiansLimit;
-    gsplat::GsplatData data(dir, num_gaussians_to_load);
+    std::string        dir = argv[1];
+    gsplat::GsplatData data(dir, kNumGaussiansToLoad, kNumImagesToLoad);
 
-    auto params = createLearningParamsFromGaussians(data.gaussians_, data.device_);
+    auto params = createLearningParamsFromGaussians(data.gaussians_, data.device_, kUseHigherShs);
     std::vector<torch::optim::OptimizerParamGroup> param_groups{createAdamParamGroup(params)};
     torch::optim::Adam                             optimizer(param_groups);
 
@@ -156,11 +131,17 @@ int main(int argc, char **argv)
 
             if (img_idx == kImageIdxToShow)
             {
+                // std::cout << "cam info: id=" << cam.id << ", w=" << cam.width << ", h=" << cam.height << std::endl;
+                // std::cout << "fx: " << cam.fx << ", fy: " << cam.fy << ", cx: " << cam.cx << ", cy: " << cam.cy
+                //           << std::endl;
+                // std::cout << "Rcw: " << cam.Rcw << std::endl;
+                // std::cout << "tcw: " << cam.tcw << std::endl;
+                // std::cout << "twc: " << cam.twc << std::endl;
                 // Show the image by copying it to CPU and converting to uint8_t
                 auto    image_cpu = image.detach().cpu().permute({1, 2, 0}).clamp(0, 1).mul(255).to(torch::kUInt8);
                 cv::Mat img_mat(image_cpu.size(0), image_cpu.size(1), CV_8UC3, image_cpu.data_ptr());
                 cv::cvtColor(img_mat, img_mat, cv::COLOR_RGB2BGR);
-                cv::imwrite("rendered_image_epoch_" + std::to_string(epoch) + ".png", img_mat);
+                cv::imwrite("cam_" + std::to_string(cam.id) + "_epoch_" + std::to_string(epoch) + ".png", img_mat);
                 cv::imshow("Rendered Image", img_mat);
                 cv::waitKey(1);
             }
@@ -173,7 +154,8 @@ int main(int argc, char **argv)
 
         if (kEnableAdaptiveDensification && (epoch % 10 == 0) && (epoch > 0))
         {
-            if (params.pws.size(0) >= kNumGaussiansLimit)
+            // if (params.pws.size(0) >= kNumGaussiansLimit)
+            if (hasReachedGpuLimit())
             {
                 std::cout << "skipping densification since number of gaussians reached limit: " << params.pws.size(0)
                           << std::endl;
@@ -184,12 +166,21 @@ int main(int argc, char **argv)
                 std::cout << "Gaussians after densification: " << params.pws.sizes() << std::endl;
                 // Reset the grad accumulation info
                 grad_accum_info.reset();
+                c10::cuda::CUDACachingAllocator::emptyCache();
             }
         }
     }
     if (!loss_plot.empty())
     {
         cv::imwrite("training_loss.png", loss_plot);
+    }
+
+    // Save
+    bool const write_ok = saveGaussiansToFile("gaussians.bin", writeParamsToGaussians(params));
+    if (!write_ok)
+    {
+        std::cerr << "Failed to save gaussians to file." << std::endl;
+        return 1;
     }
 
     return 0;

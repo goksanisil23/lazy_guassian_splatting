@@ -13,12 +13,12 @@ namespace
 
 constexpr float kScaleDownFactor = 2.0;
 
-torch::Tensor qVec2RotMat(const std::array<double, 4> &qvec)
+torch::Tensor qVec2RotMat(const std::array<float, 4> &qvec)
 {
-    float q0 = static_cast<float>(qvec[0]);
-    float q1 = static_cast<float>(qvec[1]);
-    float q2 = static_cast<float>(qvec[2]);
-    float q3 = static_cast<float>(qvec[3]);
+    const float q0 = qvec[0];
+    const float q1 = qvec[1];
+    const float q2 = qvec[2];
+    const float q3 = qvec[3];
 
     std::array<float, 9> rot_mtx{{1 - 2 * q2 * q2 - 2 * q3 * q3,
                                   2 * q1 * q2 - 2 * q0 * q3,
@@ -151,7 +151,7 @@ class GsplatData
   public:
     const torch::Device device_{torch::kCUDA};
 
-    GsplatData(const std::string &dataset_path, const int64_t max_num_gaussians)
+    GsplatData(const std::string &dataset_path, const uint32_t max_num_gaussians, const uint32_t max_num_images)
     {
         auto cams = colmap_loader::loadCameras(dataset_path + "/sparse/0/cameras.bin");
         auto ims  = colmap_loader::loadImages(dataset_path + "/sparse/0/images.bin");
@@ -177,7 +177,7 @@ class GsplatData
             cam.cy     = cams[im.camera_id].params[3] * h_scale;
 
             cam.Rcw = qVec2RotMat(im.q).to(device_, torch::kFloat32);
-            cam.tcw = torch::from_blob((void *)(im.t.data()), {3}, torch::kFloat64).to(device_, torch::kFloat32);
+            cam.tcw = torch::from_blob((void *)(im.t.data()), {3}, torch::kFloat32).to(device_, torch::kFloat32);
             cam.twc = -cam.Rcw.transpose(0, 1).matmul(cam.tcw.unsqueeze(1)).squeeze();
 
             cam.image_path          = dataset_path + "/images/" + im.name;
@@ -189,7 +189,7 @@ class GsplatData
 
         gaussians_ = initGaussiansFrom3dPoints(pts);
 
-        // TODO: (Remove) Limit the data
+        // Limit the data
         {
             std::random_device rd;
             std::mt19937       gen(rd());
@@ -210,8 +210,7 @@ class GsplatData
             gaussians_.scales.resize(max_num_gaussians);
             gaussians_.rots.resize(max_num_gaussians);
             gaussians_.alphas.resize(max_num_gaussians);
-            images_.resize(10);
-            cameras_.resize(10);
+            images_.resize(max_num_images);
         }
 
         scene_scale_ = findSceneScale(cameras_);

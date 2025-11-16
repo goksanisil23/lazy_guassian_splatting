@@ -37,8 +37,7 @@ struct Gaussians
 struct LearnableParams
 {
     torch::Tensor pws;
-    torch::Tensor low_shs;
-    torch::Tensor high_shs;
+    torch::Tensor shs;
     torch::Tensor alphas_raw;
     torch::Tensor scales_raw;
     torch::Tensor rots_raw;
@@ -47,8 +46,7 @@ struct LearnableParams
 struct AdamsParams
 {
     const float pws_lr        = 0.001f;
-    const float low_shs_lr    = 0.001f;
-    const float high_shs_lr   = 0.001f / 20.f;
+    const float shs_lr        = 0.001f;
     const float alphas_raw_lr = 0.05f;
     const float scales_raw_lr = 0.005f;
     const float rots_raw_lr   = 0.001f;

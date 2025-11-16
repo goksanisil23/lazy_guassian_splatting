@@ -10,11 +10,9 @@ namespace
 torch::Tensor upperTriangular(const torch::Tensor &mat)
 {
     using torch::indexing::Slice;
-    int64_t s    = mat.size(1);
-    auto    idx  = torch::triu_indices(s, s);
-    auto    idx0 = idx[0];
-    auto    idx1 = idx[1];
-    return mat.index({Slice(), idx0, idx1});
+    const auto size{mat.size(1)};
+    const auto idx = torch::triu_indices(size, size);
+    return mat.index({Slice(), idx[0], idx[1]});
 }
 } // namespace
 
@@ -27,26 +25,25 @@ torch::Tensor GLOBAL_IDX_MAP;
 
 // Projects 3d gaussians from world coordinates to camera coordinates.
 // Also returns the image projection of the center of 3d gaussian
-torch::Tensor project(torch::Tensor &points_world, const Camera &cam, torch::Tensor &proj_us)
+torch::Tensor project(torch::Tensor &points_world, const Camera &cam, torch::Tensor &proj_us_out)
 {
+    const torch::Tensor points_cam = torch::matmul(points_world, cam.Rcw.transpose(0, 1)) + cam.tcw;
 
-    torch::Tensor points_cam = torch::matmul(points_world, cam.Rcw.transpose(0, 1)) + cam.tcw;
-
-    torch::Tensor x = points_cam.index({torch::indexing::Slice(), 0});
-    torch::Tensor y = points_cam.index({torch::indexing::Slice(), 1});
-    torch::Tensor z = points_cam.index({torch::indexing::Slice(), 2});
+    const torch::Tensor x = points_cam.index({torch::indexing::Slice(), 0});
+    const torch::Tensor y = points_cam.index({torch::indexing::Slice(), 1});
+    const torch::Tensor z = points_cam.index({torch::indexing::Slice(), 2});
 
     // u = fx * x / z + cx
     // v = fy * y / z + cy
-    torch::Tensor u_x = x.mul(cam.fx).div(z).add(cam.cx);
-    torch::Tensor u_y = y.mul(cam.fy).div(z).add(cam.cy);
+    const torch::Tensor u_x = x.mul(cam.fx).div(z).add(cam.cx);
+    const torch::Tensor u_y = y.mul(cam.fy).div(z).add(cam.cy);
 
-    proj_us = torch::stack({u_x, u_y}, /*dim=*/1);
+    proj_us_out = torch::stack({u_x, u_y}, /*dim=*/1);
 
     return points_cam;
 }
 
-torch::Tensor computeCov3d(const torch::Tensor &scale, const torch::Tensor &rot)
+torch::Tensor computeCov3d(const torch::Tensor &scale, const torch::Tensor &quat)
 {
     const int64_t batch  = scale.size(0);
     auto const    device = scale.device();
@@ -58,27 +55,7 @@ torch::Tensor computeCov3d(const torch::Tensor &scale, const torch::Tensor &rot)
     S.index_put_({Slice(), 1, 1}, scale.index({Slice(), 1}));
     S.index_put_({Slice(), 2, 2}, scale.index({Slice(), 2}));
 
-    auto w = rot.index({Slice(), 0});
-    auto x = rot.index({Slice(), 1});
-    auto y = rot.index({Slice(), 2});
-    auto z = rot.index({Slice(), 3});
-
-    // Compute rotation matrix entries
-    auto r00 = 1 - 2 * (y * y + z * z);
-    auto r01 = 2 * (x * y - z * w);
-    auto r02 = 2 * (x * z + y * w);
-    auto r10 = 2 * (x * y + z * w);
-    auto r11 = 1 - 2 * (x * x + z * z);
-    auto r12 = 2 * (y * z - x * w);
-    auto r20 = 2 * (x * z - y * w);
-    auto r21 = 2 * (y * z + x * w);
-    auto r22 = 1 - 2 * (x * x + y * y);
-
-    // Stack rows into R: shape [batch, 3, 3]
-    auto row0 = torch::stack({r00, r01, r02}, /*dim=*/1);
-    auto row1 = torch::stack({r10, r11, r12}, /*dim=*/1);
-    auto row2 = torch::stack({r20, r21, r22}, /*dim=*/1);
-    auto R    = torch::stack({row0, row1, row2}, /*dim=*/1);
+    auto const R{quatToRotMatrix(quat)};
 
     // M = R @ S, Sigma = M @ M^T
     auto M     = torch::bmm(R, S);
@@ -94,10 +71,10 @@ torch::Tensor projectCov3dTo2d(const torch::Tensor &points_cam, const Camera &ca
     auto z = points_cam.index({Slice(), 2}); // [batch]
 
     // Compute field‐of‐view limits
-    const float tan_fovx = 2.0f * std::atan(cam.width / (2.0f * cam.fx));
-    const float tan_fovy = 2.0f * std::atan(cam.height / (2.0f * cam.fy));
-    const float limx     = 1.3f * tan_fovx;
-    const float limy     = 1.3f * tan_fovy;
+    const float tan_fovx = 2.0F * std::atan(cam.width / (2.0f * cam.fx));
+    const float tan_fovy = 2.0F * std::atan(cam.height / (2.0f * cam.fy));
+    const float limx     = 1.3F * tan_fovx;
+    const float limy     = 1.3F * tan_fovy;
 
     auto inv_z_x = x.div(z);
     inv_z_x      = torch::clamp(inv_z_x, -limx, limx);
@@ -121,23 +98,23 @@ torch::Tensor projectCov3dTo2d(const torch::Tensor &points_cam, const Camera &ca
     // J[:, 1, 2] = -(fy * y) / (z*z)
     J.index_put_({Slice(), 1, 2}, -(cam.fy * y).div(z * z));
 
-    auto T     = torch::matmul(J, cam.Rcw); // [batch, 3, 3]
-    auto Sigma = cov3d;
+    auto const T     = torch::matmul(J, cam.Rcw); // [batch, 3, 3]
+    auto const Sigma = cov3d;
     // Sigma' = T @ Sigma @ Tᵀ
-    auto TSigma      = torch::bmm(T, Sigma);
-    auto Sigma_prime = torch::bmm(TSigma, T.transpose(1, 2));
+    auto const TSigma      = torch::bmm(T, Sigma);
+    auto       Sigma_prime = torch::bmm(TSigma, T.transpose(1, 2));
 
     // inflate x & y variance by 0.3
     {
         constexpr float kInflation = 0.3F;
-        auto            diag00     = Sigma_prime.index({Slice(), 0, 0});
+        auto const      diag00     = Sigma_prime.index({Slice(), 0, 0});
         Sigma_prime.index_put_({Slice(), 0, 0}, diag00 + kInflation);
-        auto diag11 = Sigma_prime.index({Slice(), 1, 1});
+        auto const diag11 = Sigma_prime.index({Slice(), 1, 1});
         Sigma_prime.index_put_({Slice(), 1, 1}, diag11 + kInflation);
     }
 
     // Extract the top‐left 2×2 block:
-    auto Sigma2d = Sigma_prime.index({Slice(), Slice(0, 2), Slice(0, 2)});
+    auto const Sigma2d = Sigma_prime.index({Slice(), Slice(0, 2), Slice(0, 2)});
     return upperTriangular(Sigma2d);
 }
 
@@ -204,21 +181,21 @@ torch::Tensor shToColor(const torch::Tensor &sh, // [batch, sh_dim]
 torch::Tensor inverseCov2d(const torch::Tensor &cov2d, torch::Tensor &areas_3_sigma)
 {
     // cov2d: [batch, 3]
-    auto cov_xx = cov2d.index({Slice(), 0}); // [batch]
-    auto cov_xy = cov2d.index({Slice(), 1}); // [batch]
-    auto cov_yy = cov2d.index({Slice(), 2}); // [batch]
+    auto const cov_xx = cov2d.index({Slice(), 0}); // [batch]
+    auto const cov_xy = cov2d.index({Slice(), 1}); // [batch]
+    auto const cov_yy = cov2d.index({Slice(), 2}); // [batch]
 
-    auto det_term = cov_xx * cov_yy - cov_xy * cov_xy + 1e-6;
-    auto det_inv  = det_term.reciprocal(); // [batch]
+    auto const det_term = cov_xx * cov_yy - cov_xy * cov_xy + 1e-6;
+    auto const det_inv  = det_term.reciprocal(); // [batch]
 
-    auto c00       = cov_yy.mul(det_inv);
-    auto c01       = cov_xy.mul(det_inv).neg();
-    auto c11       = cov_xx.mul(det_inv);
-    auto cov2d_inv = torch::stack({c00, c01, c11}, /*dim=*/1); // [batch, 3]
+    auto const c00       = cov_yy.mul(det_inv);
+    auto const c01       = cov_xy.mul(det_inv).neg();
+    auto const c11       = cov_xx.mul(det_inv);
+    auto const cov2d_inv = torch::stack({c00, c01, c11}, /*dim=*/1); // [batch, 3]
 
-    auto stacked  = torch::stack({cov_xx, cov_yy}, /*dim=*/1); // [batch, 2]
-    auto sqrted   = torch::sqrt(stacked);
-    areas_3_sigma = sqrted.mul(3.0).to(torch::kInt32); // [batch, 2]
+    const auto stacked = torch::stack({cov_xx, cov_yy}, /*dim=*/1); // [batch, 2]
+    const auto sqrted  = torch::sqrt(stacked);
+    areas_3_sigma      = sqrted.mul(3.0).to(torch::kInt32); // [batch, 2]
 
     return cov2d_inv;
 }
@@ -238,8 +215,8 @@ torch::Tensor splatTiled(const Camera  &cam,
     torch::Tensor image = torch::zeros({cam.height, cam.width, 3}, torch::TensorOptions().device(device).dtype(dtype));
 
     // Sort indices by depth (ascending)
-    torch::Tensor depth_sorted_idxs = depths.argsort();
-    const int64_t num_gaussians     = depths.size(0);
+    torch::Tensor const depth_sorted_idxs = depths.argsort();
+    const int64_t       num_gaussians     = depths.size(0);
 
     // constexpr int TW = 64, TH = 64; // tile width & height
     constexpr int TW = 32, TH = 32; // tile width & height
@@ -411,7 +388,6 @@ torch::Tensor forwardWithCulling(LearnableParams &params,
     auto alphas = getAlphas(params.alphas_raw);
     auto scales = getScales(params.scales_raw);
     auto rots   = getRots(params.rots_raw);
-    auto shs    = getShs(params.low_shs, params.high_shs);
 
     // 1) Project 3D gaussian centers to camera coordinates and image coordinates
     auto gaus_centers_cam_frame = project(params.pws, cam, gaus_centers_img_frame_out);
@@ -428,11 +404,11 @@ torch::Tensor forwardWithCulling(LearnableParams &params,
     const auto r_x_ndc  = radii_3d * (cam.fx / z) / cam.width * 2.0f; // radius in normalized image coordinates
     const auto r_y_ndc  = radii_3d * (cam.fy / z) / cam.height * 2.0f;
     // Check if within the camera frustum (6 sides)
-    constexpr float kNearClip = 0.2F;
-    constexpr float kFarClip  = 100.0F;
-    auto frustum_cull_mask    = (z > kNearClip) & (z < kFarClip) & (u_ndc + r_x_ndc > -1) & (u_ndc - r_x_ndc < 1) &
-                             (v_ndc + r_y_ndc > -1) & (v_ndc - r_y_ndc < 1);
-    auto culled_gaus_ids = frustum_cull_mask.nonzero().squeeze(1); // [M]
+    constexpr float kNearClip    = 0.2F;
+    constexpr float kFarClip     = 100.0F;
+    auto const frustum_cull_mask = (z > kNearClip) & (z < kFarClip) & (u_ndc + r_x_ndc > -1) & (u_ndc - r_x_ndc < 1) &
+                                   (v_ndc + r_y_ndc > -1) & (v_ndc - r_y_ndc < 1);
+    auto const culled_gaus_ids = frustum_cull_mask.nonzero().squeeze(1); // [M]
     std::cout << "Survived Gaussians after Frustum Culling: " << culled_gaus_ids.size(0) << " / " << params.pws.size(0)
               << std::endl;
 
@@ -442,12 +418,12 @@ torch::Tensor forwardWithCulling(LearnableParams &params,
     auto scales_culled                 = scales.index({culled_gaus_ids});                     // [M,3]
     auto rots_culled                   = rots.index({culled_gaus_ids});                       // [M,3,3]
     auto gaus_centers_img_frame_culled = gaus_centers_img_frame_out.index({culled_gaus_ids}); // [M,2]
-    auto shs_culled                    = shs.index({culled_gaus_ids});                        // [M, sh_dim]
+    auto shs_culled                    = params.shs.index({culled_gaus_ids});                 // [M, sh_dim]
 
     // 3) Compute 3D covariance matrices for each gaussian
-    auto cov3d_culled = computeCov3d(scales_culled, rots_culled);
+    auto const cov3d_culled = computeCov3d(scales_culled, rots_culled);
     // 4) Project 3d gaussian to 2d
-    auto cov2d_culled = projectCov3dTo2d(gaus_centers_cam_frame.index({culled_gaus_ids}), cam, cov3d_culled);
+    auto const cov2d_culled = projectCov3dTo2d(gaus_centers_cam_frame.index({culled_gaus_ids}), cam, cov3d_culled);
     // 5)  Compute colors via spherical harmonics
     auto colors_culled = shToColor(shs_culled, pws_culled, cam.tcw);
     // 6) Find 3 sigma areas gaussian would cover in image space

@@ -49,6 +49,7 @@ cv::Mat plotLosses(const std::vector<float> &losses)
     }
 
     cv::imshow("Training Loss", plot);
+    cv::moveWindow("Training Loss", 800, 100);
     cv::waitKey(1);
 
     return plot;

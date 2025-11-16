@@ -1,4 +1,5 @@
 #include <algorithm>
+
 #include <fstream>
 #include <numeric>
 #include <random>
@@ -26,8 +27,7 @@ void pruneParams(LearnableParams &params, const torch::Tensor &prune_mask, const
 
     std::cout << "Pruned Gaussians: " << prune_mask.sum().item<int64_t>() << " / " << params.pws.size(0) << std::endl;
     replace_in_place(params.pws, keep_mask);
-    replace_in_place(params.low_shs, keep_mask);
-    replace_in_place(params.high_shs, keep_mask);
+    replace_in_place(params.shs, keep_mask);
     replace_in_place(params.alphas_raw, keep_mask);
     replace_in_place(params.scales_raw, keep_mask);
     replace_in_place(params.rots_raw, keep_mask);
@@ -35,30 +35,8 @@ void pruneParams(LearnableParams &params, const torch::Tensor &prune_mask, const
 
 torch::Tensor rotateByQuaternion(const torch::Tensor &quat, const torch::Tensor &vec)
 {
-    using torch::indexing::Slice;
 
-    auto w = quat.index({Slice(), 0});
-    auto x = quat.index({Slice(), 1});
-    auto y = quat.index({Slice(), 2});
-    auto z = quat.index({Slice(), 3});
-
-    // Compute rotation matrix entries
-    auto r00 = 1 - 2 * (y * y + z * z);
-    auto r01 = 2 * (x * y - z * w);
-    auto r02 = 2 * (x * z + y * w);
-    auto r10 = 2 * (x * y + z * w);
-    auto r11 = 1 - 2 * (x * x + z * z);
-    auto r12 = 2 * (y * z - x * w);
-    auto r20 = 2 * (x * z - y * w);
-    auto r21 = 2 * (y * z + x * w);
-    auto r22 = 1 - 2 * (x * x + y * y);
-
-    // Stack rows into R: shape [batch, 3, 3]
-    auto row0 = torch::stack({r00, r01, r02}, /*dim=*/1);
-    auto row1 = torch::stack({r10, r11, r12}, /*dim=*/1);
-    auto row2 = torch::stack({r20, r21, r22}, /*dim=*/1);
-    auto R    = torch::stack({row0, row1, row2}, /*dim=*/1);
-
+    auto const R{quatToRotMatrix(quat)}; // (N,3,3)
     // apply rotation: (N,3,3) @ (N,3,1) -> (N,3)
     return torch::bmm(R, vec.unsqueeze(-1)).squeeze(-1);
 }
@@ -99,6 +77,7 @@ void adaptiveDensification(LearnableParams     &params,
                            const float          scene_scale)
 {
     using torch::indexing::Slice;
+
     auto const device      = params.pws.device();
     auto const dtype       = params.pws.scalar_type();
     auto const tensor_opts = torch::TensorOptions().device(device).dtype(dtype);
@@ -129,12 +108,12 @@ void adaptiveDensification(LearnableParams     &params,
         keep_mask = torch::ones({params.pws.size(0)}, torch::TensorOptions().device(device).dtype(torch::kBool));
     }
 
-    auto pws      = params.pws;
-    auto low_shs  = params.low_shs;
-    auto high_shs = params.high_shs;
-    auto alphas   = getAlphas(params.alphas_raw);
-    auto scales   = getScales(params.scales_raw);
-    auto rots     = getRots(params.rots_raw);
+    auto pws = params.pws;
+    auto shs = params.shs;
+    // auto high_shs = params.high_shs;
+    auto alphas = getAlphas(params.alphas_raw);
+    auto scales = getScales(params.scales_raw);
+    auto rots   = getRots(params.rots_raw);
 
     // ------ 2) Densification ------ //
     const float scale_thresh_densification = kScaleThreshDensification * scene_scale;
@@ -157,23 +136,23 @@ void adaptiveDensification(LearnableParams     &params,
               << "  Clone count: " << clone_mask.sum().item<int64_t>() << "  Split count: " << split_size << std::endl;
 
     // Clone gaussians
-    auto pws_clone      = pws.index({clone_mask});
-    auto low_shs_clone  = low_shs.index({clone_mask});
-    auto high_shs_clone = high_shs.index({clone_mask});
-    auto alphas_clone   = alphas.index({clone_mask});
-    auto scales_clone   = scales.index({clone_mask});
-    auto rots_clone     = rots.index({clone_mask});
+    auto pws_clone = pws.index({clone_mask});
+    auto shs_clone = shs.index({clone_mask});
+    // auto high_shs_clone = high_shs.index({clone_mask});
+    auto alphas_clone = alphas.index({clone_mask});
+    auto scales_clone = scales.index({clone_mask});
+    auto rots_clone   = rots.index({clone_mask});
 
     // Split gaussians
     auto const          rots_split               = rots.index({split_mask});
     auto                split_gaussian_rot_means = torch::zeros({split_size, 3}, tensor_opts);
     auto                split_gaussian_rot_stds  = scales.index({split_mask});
-    torch::Tensor const samples        = at::normal(split_gaussian_rot_means, split_gaussian_rot_stds, c10::nullopt);
-    auto const          pws_split      = pws.index({split_mask}) + rotateByQuaternion(rots_split, samples);
-    auto const          alphas_split   = alphas.index({split_mask});
-    auto const          scales_split   = scales.index({split_mask}).mul(kSplitScaleFactor);
-    auto const          low_shs_split  = low_shs.index({split_mask});
-    auto const          high_shs_split = high_shs.index({split_mask});
+    torch::Tensor const samples      = at::normal(split_gaussian_rot_means, split_gaussian_rot_stds, c10::nullopt);
+    auto const          pws_split    = pws.index({split_mask}) + rotateByQuaternion(rots_split, samples);
+    auto const          alphas_split = alphas.index({split_mask});
+    auto const          scales_split = scales.index({split_mask}).mul(kSplitScaleFactor);
+    auto const          shs_split    = shs.index({split_mask});
+    // auto const          high_shs_split = high_shs.index({split_mask});
 
     auto append_params =
         [](const torch::Tensor &old_params, const torch::Tensor &new_params_1, const torch::Tensor &new_params_2)
@@ -184,9 +163,9 @@ void adaptiveDensification(LearnableParams     &params,
         return out.detach().set_requires_grad(true);
     };
 
-    params.pws        = append_params(pws, pws_clone, pws_split);
-    params.low_shs    = append_params(low_shs, low_shs_clone, low_shs_split);
-    params.high_shs   = append_params(high_shs, high_shs_clone, high_shs_split);
+    params.pws = append_params(pws, pws_clone, pws_split);
+    params.shs = append_params(shs, shs_clone, shs_split);
+    // params.high_shs   = append_params(high_shs, high_shs_clone, high_shs_split);
     params.alphas_raw = append_params(params.alphas_raw, getAlphasRaw(alphas_clone), getAlphasRaw(alphas_split));
     params.scales_raw = append_params(params.scales_raw, getScalesRaw(scales_clone), getScalesRaw(scales_split));
     params.rots_raw   = append_params(params.rots_raw, rots_clone, rots_split);
